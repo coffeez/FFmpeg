@@ -1,6 +1,6 @@
 /*
- * H.264 hardware encoding using nvidia nvenc
- * Copyright (c) 2014 Timo Rothenpieler <timo@rothenpieler.org>
+ * H.264/HEVC hardware encoding using nvidia nvenc
+ * Copyright (c) 2016 Timo Rothenpieler <timo@rothenpieler.org>
  *
  * This file is part of FFmpeg.
  *
@@ -19,217 +19,81 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config.h"
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+# define CUDA_LIBNAME "nvcuda.dll"
+# if ARCH_X86_64
+#  define NVENC_LIBNAME "nvEncodeAPI64.dll"
+# else
+#  define NVENC_LIBNAME "nvEncodeAPI.dll"
+# endif
+#else
+# define CUDA_LIBNAME "libcuda.so.1"
+# define NVENC_LIBNAME "libnvidia-encode.so.1"
+#endif
+
 #if defined(_WIN32)
 #include <windows.h>
+
+#define dlopen(filename, flags) LoadLibrary(TEXT(filename))
+#define dlsym(handle, symbol)   GetProcAddress(handle, symbol)
+#define dlclose(handle)         FreeLibrary(handle)
 #else
 #include <dlfcn.h>
 #endif
 
-#include <nvEncodeAPI.h>
-
-#include "libavutil/fifo.h"
-#include "libavutil/internal.h"
+#include "libavutil/hwcontext.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/avassert.h"
-#include "libavutil/opt.h"
 #include "libavutil/mem.h"
-#include "libavutil/hwcontext.h"
-#include "avcodec.h"
 #include "internal.h"
-#include "thread.h"
+#include "nvenc.h"
 
+#define NVENC_CAP 0x30
+#define IS_CBR(rc) (rc == NV_ENC_PARAMS_RC_CBR ||               \
+                    rc == NV_ENC_PARAMS_RC_2_PASS_QUALITY ||    \
+                    rc == NV_ENC_PARAMS_RC_2_PASS_FRAMESIZE_CAP)
 
+#define LOAD_LIBRARY(l, path)                   \
+    do {                                        \
+        if (!((l) = dlopen(path, RTLD_LAZY))) { \
+            av_log(avctx, AV_LOG_ERROR,         \
+                   "Cannot load %s\n",          \
+                   path);                       \
+            return AVERROR_UNKNOWN;             \
+        }                                       \
+    } while (0)
+
+#define LOAD_SYMBOL(fun, lib, symbol)        \
+    do {                                     \
+        if (!((fun) = dlsym(lib, symbol))) { \
+            av_log(avctx, AV_LOG_ERROR,      \
+                   "Cannot load %s\n",       \
+                   symbol);                  \
+            return AVERROR_UNKNOWN;          \
+        }                                    \
+    } while (0)
+
+const enum AVPixelFormat ff_nvenc_pix_fmts[] = {
+    AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_NV12,
+    AV_PIX_FMT_P010,
+    AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_YUV444P16,
+    AV_PIX_FMT_0RGB32,
+    AV_PIX_FMT_0BGR32,
 #if CONFIG_CUDA
-#include <cuda.h>
-#include "libavutil/hwcontext_cuda.h"
-#else
-
-#if defined(_WIN32)
-#define CUDAAPI __stdcall
-#else
-#define CUDAAPI
+    AV_PIX_FMT_CUDA,
 #endif
-
-typedef enum cudaError_enum {
-    CUDA_SUCCESS = 0
-} CUresult;
-typedef int CUdevice;
-typedef void* CUcontext;
-typedef void* CUdeviceptr;
-#endif
-
-#if defined(_WIN32)
-#define LOAD_FUNC(l, s) GetProcAddress(l, s)
-#define DL_CLOSE_FUNC(l) FreeLibrary(l)
-#else
-#define LOAD_FUNC(l, s) dlsym(l, s)
-#define DL_CLOSE_FUNC(l) dlclose(l)
-#endif
-
-typedef CUresult(CUDAAPI *PCUINIT)(unsigned int Flags);
-typedef CUresult(CUDAAPI *PCUDEVICEGETCOUNT)(int *count);
-typedef CUresult(CUDAAPI *PCUDEVICEGET)(CUdevice *device, int ordinal);
-typedef CUresult(CUDAAPI *PCUDEVICEGETNAME)(char *name, int len, CUdevice dev);
-typedef CUresult(CUDAAPI *PCUDEVICECOMPUTECAPABILITY)(int *major, int *minor, CUdevice dev);
-typedef CUresult(CUDAAPI *PCUCTXCREATE)(CUcontext *pctx, unsigned int flags, CUdevice dev);
-typedef CUresult(CUDAAPI *PCUCTXPOPCURRENT)(CUcontext *pctx);
-typedef CUresult(CUDAAPI *PCUCTXDESTROY)(CUcontext ctx);
-
-typedef NVENCSTATUS (NVENCAPI* PNVENCODEAPICREATEINSTANCE)(NV_ENCODE_API_FUNCTION_LIST *functionList);
-
-#define MAX_REGISTERED_FRAMES 64
-typedef struct NvencSurface
-{
-    NV_ENC_INPUT_PTR input_surface;
-    AVFrame *in_ref;
-    NV_ENC_MAP_INPUT_RESOURCE in_map;
-    int reg_idx;
-    int width;
-    int height;
-
-    int lockCount;
-
-    NV_ENC_BUFFER_FORMAT format;
-
-    NV_ENC_OUTPUT_PTR output_surface;
-    int size;
-} NvencSurface;
-
-typedef struct NvencData
-{
-    union {
-        int64_t timestamp;
-        NvencSurface *surface;
-    } u;
-} NvencData;
-
-typedef struct NvencDynLoadFunctions
-{
-    PCUINIT cu_init;
-    PCUDEVICEGETCOUNT cu_device_get_count;
-    PCUDEVICEGET cu_device_get;
-    PCUDEVICEGETNAME cu_device_get_name;
-    PCUDEVICECOMPUTECAPABILITY cu_device_compute_capability;
-    PCUCTXCREATE cu_ctx_create;
-    PCUCTXPOPCURRENT cu_ctx_pop_current;
-    PCUCTXDESTROY cu_ctx_destroy;
-
-    NV_ENCODE_API_FUNCTION_LIST nvenc_funcs;
-    int nvenc_device_count;
-    CUdevice nvenc_devices[16];
-
-#if !CONFIG_CUDA
-#if defined(_WIN32)
-    HMODULE cuda_lib;
-#else
-    void* cuda_lib;
-#endif
-#endif
-#if defined(_WIN32)
-    HMODULE nvenc_lib;
-#else
-    void* nvenc_lib;
-#endif
-} NvencDynLoadFunctions;
-
-typedef struct NvencValuePair
-{
-    const char *str;
-    uint32_t num;
-} NvencValuePair;
-
-typedef struct NvencContext
-{
-    AVClass *avclass;
-
-    NvencDynLoadFunctions nvenc_dload_funcs;
-
-    NV_ENC_INITIALIZE_PARAMS init_encode_params;
-    NV_ENC_CONFIG encode_config;
-    CUcontext cu_context;
-    CUcontext cu_context_internal;
-
-    int max_surface_count;
-    NvencSurface *surfaces;
-
-    AVFifoBuffer *output_surface_queue;
-    AVFifoBuffer *output_surface_ready_queue;
-    AVFifoBuffer *timestamp_list;
-    int64_t last_dts;
-
-    struct {
-        CUdeviceptr ptr;
-        NV_ENC_REGISTERED_PTR regptr;
-        int mapped;
-    } registered_frames[MAX_REGISTERED_FRAMES];
-    int nb_registered_frames;
-
-    /* the actual data pixel format, different from
-     * AVCodecContext.pix_fmt when using hwaccel frames on input */
-    enum AVPixelFormat data_pix_fmt;
-
-    void *nvencoder;
-
-    char *preset;
-    char *profile;
-    char *level;
-    char *tier;
-    int cbr;
-    int twopass;
-    int gpu;
-    int buffer_delay;
-} NvencContext;
-
-static const NvencValuePair nvenc_h264_level_pairs[] = {
-    { "auto", NV_ENC_LEVEL_AUTOSELECT },
-    { "1"   , NV_ENC_LEVEL_H264_1     },
-    { "1.0" , NV_ENC_LEVEL_H264_1     },
-    { "1b"  , NV_ENC_LEVEL_H264_1b    },
-    { "1.0b", NV_ENC_LEVEL_H264_1b    },
-    { "1.1" , NV_ENC_LEVEL_H264_11    },
-    { "1.2" , NV_ENC_LEVEL_H264_12    },
-    { "1.3" , NV_ENC_LEVEL_H264_13    },
-    { "2"   , NV_ENC_LEVEL_H264_2     },
-    { "2.0" , NV_ENC_LEVEL_H264_2     },
-    { "2.1" , NV_ENC_LEVEL_H264_21    },
-    { "2.2" , NV_ENC_LEVEL_H264_22    },
-    { "3"   , NV_ENC_LEVEL_H264_3     },
-    { "3.0" , NV_ENC_LEVEL_H264_3     },
-    { "3.1" , NV_ENC_LEVEL_H264_31    },
-    { "3.2" , NV_ENC_LEVEL_H264_32    },
-    { "4"   , NV_ENC_LEVEL_H264_4     },
-    { "4.0" , NV_ENC_LEVEL_H264_4     },
-    { "4.1" , NV_ENC_LEVEL_H264_41    },
-    { "4.2" , NV_ENC_LEVEL_H264_42    },
-    { "5"   , NV_ENC_LEVEL_H264_5     },
-    { "5.0" , NV_ENC_LEVEL_H264_5     },
-    { "5.1" , NV_ENC_LEVEL_H264_51    },
-    { NULL }
+    AV_PIX_FMT_NONE
 };
 
-static const NvencValuePair nvenc_hevc_level_pairs[] = {
-    { "auto", NV_ENC_LEVEL_AUTOSELECT },
-    { "1"   , NV_ENC_LEVEL_HEVC_1     },
-    { "1.0" , NV_ENC_LEVEL_HEVC_1     },
-    { "2"   , NV_ENC_LEVEL_HEVC_2     },
-    { "2.0" , NV_ENC_LEVEL_HEVC_2     },
-    { "2.1" , NV_ENC_LEVEL_HEVC_21    },
-    { "3"   , NV_ENC_LEVEL_HEVC_3     },
-    { "3.0" , NV_ENC_LEVEL_HEVC_3     },
-    { "3.1" , NV_ENC_LEVEL_HEVC_31    },
-    { "4"   , NV_ENC_LEVEL_HEVC_4     },
-    { "4.0" , NV_ENC_LEVEL_HEVC_4     },
-    { "4.1" , NV_ENC_LEVEL_HEVC_41    },
-    { "5"   , NV_ENC_LEVEL_HEVC_5     },
-    { "5.0" , NV_ENC_LEVEL_HEVC_5     },
-    { "5.1" , NV_ENC_LEVEL_HEVC_51    },
-    { "5.2" , NV_ENC_LEVEL_HEVC_52    },
-    { "6"   , NV_ENC_LEVEL_HEVC_6     },
-    { "6.0" , NV_ENC_LEVEL_HEVC_6     },
-    { "6.1" , NV_ENC_LEVEL_HEVC_61    },
-    { "6.2" , NV_ENC_LEVEL_HEVC_62    },
-    { NULL }
-};
+#define IS_10BIT(pix_fmt) (pix_fmt == AV_PIX_FMT_P010 ||    \
+                           pix_fmt == AV_PIX_FMT_YUV444P16)
+
+#define IS_YUV444(pix_fmt) (pix_fmt == AV_PIX_FMT_YUV444P || \
+                            pix_fmt == AV_PIX_FMT_YUV444P16)
 
 static const struct {
     NVENCSTATUS nverr;
@@ -250,7 +114,7 @@ static const struct {
     { NV_ENC_ERR_ENCODER_NOT_INITIALIZED,  AVERROR(EINVAL),  "encoder not initialized"  },
     { NV_ENC_ERR_UNSUPPORTED_PARAM,        AVERROR(ENOSYS),  "unsupported param"        },
     { NV_ENC_ERR_LOCK_BUSY,                AVERROR(EAGAIN),  "lock busy"                },
-    { NV_ENC_ERR_NOT_ENOUGH_BUFFER,        AVERROR(ENOBUFS), "not enough buffer"        },
+    { NV_ENC_ERR_NOT_ENOUGH_BUFFER,        AVERROR_BUFFER_TOO_SMALL, "not enough buffer"},
     { NV_ENC_ERR_INVALID_VERSION,          AVERROR(EINVAL),  "invalid version"          },
     { NV_ENC_ERR_MAP_FAILED,               AVERROR(EIO),     "map failed"               },
     { NV_ENC_ERR_NEED_MORE_INPUT,          AVERROR(EAGAIN),  "need more input"          },
@@ -289,45 +153,14 @@ static int nvenc_print_error(void *log_ctx, NVENCSTATUS err,
     return ret;
 }
 
-static int input_string_to_uint32(AVCodecContext *avctx, const NvencValuePair *pair, const char *input, uint32_t *output)
-{
-    for (; pair->str; ++pair) {
-        if (!strcmp(input, pair->str)) {
-            *output = pair->num;
-            return 0;
-        }
-    }
-
-    return AVERROR(EINVAL);
-}
-
-static void timestamp_queue_enqueue(AVFifoBuffer* queue, int64_t timestamp)
-{
-    av_fifo_generic_write(queue, &timestamp, sizeof(timestamp), NULL);
-}
-
-static int64_t timestamp_queue_dequeue(AVFifoBuffer* queue)
-{
-    int64_t timestamp = AV_NOPTS_VALUE;
-    if (av_fifo_size(queue) > 0)
-        av_fifo_generic_read(queue, &timestamp, sizeof(timestamp), NULL);
-
-    return timestamp;
-}
-
-#define CHECK_LOAD_FUNC(t, f, s) \
-do { \
-    (f) = (t)LOAD_FUNC(dl_fn->cuda_lib, s); \
-    if (!(f)) { \
-        av_log(avctx, AV_LOG_FATAL, "Failed loading %s from CUDA library\n", s); \
-        goto error; \
-    } \
-} while (0)
-
-static av_cold int nvenc_dyload_cuda(AVCodecContext *avctx)
+static av_cold int nvenc_load_libraries(AVCodecContext *avctx)
 {
     NvencContext *ctx = avctx->priv_data;
     NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
+    PNVENCODEAPIGETMAXSUPPORTEDVERSION nvenc_get_max_ver;
+    PNVENCODEAPICREATEINSTANCE nvenc_create_instance;
+    NVENCSTATUS err;
+    uint32_t nvenc_max_ver;
 
 #if CONFIG_CUDA
     dl_fn->cu_init                      = cuInit;
@@ -338,210 +171,268 @@ static av_cold int nvenc_dyload_cuda(AVCodecContext *avctx)
     dl_fn->cu_ctx_create                = cuCtxCreate_v2;
     dl_fn->cu_ctx_pop_current           = cuCtxPopCurrent_v2;
     dl_fn->cu_ctx_destroy               = cuCtxDestroy_v2;
-
-    return 1;
 #else
-    if (dl_fn->cuda_lib)
-        return 1;
+    LOAD_LIBRARY(dl_fn->cuda, CUDA_LIBNAME);
 
-#if defined(_WIN32)
-    dl_fn->cuda_lib = LoadLibrary(TEXT("nvcuda.dll"));
-#else
-    dl_fn->cuda_lib = dlopen("libcuda.so", RTLD_LAZY);
+    LOAD_SYMBOL(dl_fn->cu_init, dl_fn->cuda, "cuInit");
+    LOAD_SYMBOL(dl_fn->cu_device_get_count, dl_fn->cuda, "cuDeviceGetCount");
+    LOAD_SYMBOL(dl_fn->cu_device_get, dl_fn->cuda, "cuDeviceGet");
+    LOAD_SYMBOL(dl_fn->cu_device_get_name, dl_fn->cuda, "cuDeviceGetName");
+    LOAD_SYMBOL(dl_fn->cu_device_compute_capability, dl_fn->cuda,
+                "cuDeviceComputeCapability");
+    LOAD_SYMBOL(dl_fn->cu_ctx_create, dl_fn->cuda, "cuCtxCreate_v2");
+    LOAD_SYMBOL(dl_fn->cu_ctx_pop_current, dl_fn->cuda, "cuCtxPopCurrent_v2");
+    LOAD_SYMBOL(dl_fn->cu_ctx_destroy, dl_fn->cuda, "cuCtxDestroy_v2");
 #endif
 
-    if (!dl_fn->cuda_lib) {
-        av_log(avctx, AV_LOG_FATAL, "Failed loading CUDA library\n");
-        goto error;
-    }
+    LOAD_LIBRARY(dl_fn->nvenc, NVENC_LIBNAME);
 
-    CHECK_LOAD_FUNC(PCUINIT, dl_fn->cu_init, "cuInit");
-    CHECK_LOAD_FUNC(PCUDEVICEGETCOUNT, dl_fn->cu_device_get_count, "cuDeviceGetCount");
-    CHECK_LOAD_FUNC(PCUDEVICEGET, dl_fn->cu_device_get, "cuDeviceGet");
-    CHECK_LOAD_FUNC(PCUDEVICEGETNAME, dl_fn->cu_device_get_name, "cuDeviceGetName");
-    CHECK_LOAD_FUNC(PCUDEVICECOMPUTECAPABILITY, dl_fn->cu_device_compute_capability, "cuDeviceComputeCapability");
-    CHECK_LOAD_FUNC(PCUCTXCREATE, dl_fn->cu_ctx_create, "cuCtxCreate_v2");
-    CHECK_LOAD_FUNC(PCUCTXPOPCURRENT, dl_fn->cu_ctx_pop_current, "cuCtxPopCurrent_v2");
-    CHECK_LOAD_FUNC(PCUCTXDESTROY, dl_fn->cu_ctx_destroy, "cuCtxDestroy_v2");
+    LOAD_SYMBOL(nvenc_get_max_ver, dl_fn->nvenc,
+                "NvEncodeAPIGetMaxSupportedVersion");
+    LOAD_SYMBOL(nvenc_create_instance, dl_fn->nvenc,
+                "NvEncodeAPICreateInstance");
 
-    return 1;
+    err = nvenc_get_max_ver(&nvenc_max_ver);
+    if (err != NV_ENC_SUCCESS)
+        return nvenc_print_error(avctx, err, "Failed to query nvenc max version");
 
-error:
+    av_log(avctx, AV_LOG_VERBOSE, "Loaded Nvenc version %d.%d\n", nvenc_max_ver >> 4, nvenc_max_ver & 0xf);
 
-    if (dl_fn->cuda_lib)
-        DL_CLOSE_FUNC(dl_fn->cuda_lib);
-
-    dl_fn->cuda_lib = NULL;
-
-    return 0;
-#endif
-}
-
-static av_cold int check_cuda_errors(AVCodecContext *avctx, CUresult err, const char *func)
-{
-    if (err != CUDA_SUCCESS) {
-        av_log(avctx, AV_LOG_FATAL, ">> %s - failed with error code 0x%x\n", func, err);
-        return 0;
-    }
-    return 1;
-}
-#define check_cuda_errors(f) if (!check_cuda_errors(avctx, f, #f)) goto error
-
-static av_cold int nvenc_check_cuda(AVCodecContext *avctx)
-{
-    int device_count = 0;
-    CUdevice cu_device = 0;
-    char gpu_name[128];
-    int smminor = 0, smmajor = 0;
-    int i, smver, target_smver;
-
-    NvencContext *ctx = avctx->priv_data;
-    NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
-
-    switch (avctx->codec->id) {
-    case AV_CODEC_ID_H264:
-        target_smver = ctx->data_pix_fmt == AV_PIX_FMT_YUV444P ? 0x52 : 0x30;
-        break;
-    case AV_CODEC_ID_H265:
-        target_smver = 0x52;
-        break;
-    default:
-        av_log(avctx, AV_LOG_FATAL, "Unknown codec name\n");
-        goto error;
-    }
-
-    if (!strncmp(ctx->preset, "lossless", 8))
-        target_smver = 0x52;
-
-    if (!nvenc_dyload_cuda(avctx))
-        return 0;
-
-    if (dl_fn->nvenc_device_count > 0)
-        return 1;
-
-    check_cuda_errors(dl_fn->cu_init(0));
-
-    check_cuda_errors(dl_fn->cu_device_get_count(&device_count));
-
-    if (!device_count) {
-        av_log(avctx, AV_LOG_FATAL, "No CUDA capable devices found\n");
-        goto error;
-    }
-
-    av_log(avctx, AV_LOG_VERBOSE, "%d CUDA capable devices found\n", device_count);
-
-    dl_fn->nvenc_device_count = 0;
-
-    for (i = 0; i < device_count; ++i) {
-        check_cuda_errors(dl_fn->cu_device_get(&cu_device, i));
-        check_cuda_errors(dl_fn->cu_device_get_name(gpu_name, sizeof(gpu_name), cu_device));
-        check_cuda_errors(dl_fn->cu_device_compute_capability(&smmajor, &smminor, cu_device));
-
-        smver = (smmajor << 4) | smminor;
-
-        av_log(avctx, AV_LOG_VERBOSE, "[ GPU #%d - < %s > has Compute SM %d.%d, NVENC %s ]\n", i, gpu_name, smmajor, smminor, (smver >= target_smver) ? "Available" : "Not Available");
-
-        if (smver >= target_smver)
-            dl_fn->nvenc_devices[dl_fn->nvenc_device_count++] = cu_device;
-    }
-
-    if (!dl_fn->nvenc_device_count) {
-        av_log(avctx, AV_LOG_FATAL, "No NVENC capable devices found\n");
-        goto error;
-    }
-
-    return 1;
-
-error:
-
-    dl_fn->nvenc_device_count = 0;
-
-    return 0;
-}
-
-static av_cold int nvenc_dyload_nvenc(AVCodecContext *avctx)
-{
-    PNVENCODEAPICREATEINSTANCE nvEncodeAPICreateInstance = 0;
-    NVENCSTATUS nvstatus;
-
-    NvencContext *ctx = avctx->priv_data;
-    NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
-
-    if (!nvenc_check_cuda(avctx))
-        return 0;
-
-    if (dl_fn->nvenc_lib)
-        return 1;
-
-#if defined(_WIN32)
-    if (sizeof(void*) == 8) {
-        dl_fn->nvenc_lib = LoadLibrary(TEXT("nvEncodeAPI64.dll"));
-    } else {
-        dl_fn->nvenc_lib = LoadLibrary(TEXT("nvEncodeAPI.dll"));
-    }
-#else
-    dl_fn->nvenc_lib = dlopen("libnvidia-encode.so.1", RTLD_LAZY);
-#endif
-
-    if (!dl_fn->nvenc_lib) {
-        av_log(avctx, AV_LOG_FATAL, "Failed loading the nvenc library\n");
-        goto error;
-    }
-
-    nvEncodeAPICreateInstance = (PNVENCODEAPICREATEINSTANCE)LOAD_FUNC(dl_fn->nvenc_lib, "NvEncodeAPICreateInstance");
-
-    if (!nvEncodeAPICreateInstance) {
-        av_log(avctx, AV_LOG_FATAL, "Failed to load nvenc entrypoint\n");
-        goto error;
+    if ((NVENCAPI_MAJOR_VERSION << 4 | NVENCAPI_MINOR_VERSION) > nvenc_max_ver) {
+        av_log(avctx, AV_LOG_ERROR, "Driver does not support the required nvenc API version. "
+               "Required: %d.%d Found: %d.%d\n",
+               NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION,
+               nvenc_max_ver >> 4, nvenc_max_ver & 0xf);
+        return AVERROR(ENOSYS);
     }
 
     dl_fn->nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
 
-    nvstatus = nvEncodeAPICreateInstance(&dl_fn->nvenc_funcs);
-
-    if (nvstatus != NV_ENC_SUCCESS) {
-        nvenc_print_error(avctx, nvstatus, "Failed to create nvenc instance");
-        goto error;
-    }
+    err = nvenc_create_instance(&dl_fn->nvenc_funcs);
+    if (err != NV_ENC_SUCCESS)
+        return nvenc_print_error(avctx, err, "Failed to create nvenc instance");
 
     av_log(avctx, AV_LOG_VERBOSE, "Nvenc initialized successfully\n");
-
-    return 1;
-
-error:
-    if (dl_fn->nvenc_lib)
-        DL_CLOSE_FUNC(dl_fn->nvenc_lib);
-
-    dl_fn->nvenc_lib = NULL;
 
     return 0;
 }
 
-static av_cold void nvenc_unload_nvenc(AVCodecContext *avctx)
+static av_cold int nvenc_open_session(AVCodecContext *avctx)
+{
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS params = { 0 };
+    NvencContext *ctx = avctx->priv_data;
+    NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &ctx->nvenc_dload_funcs.nvenc_funcs;
+    NVENCSTATUS ret;
+
+    params.version    = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+    params.apiVersion = NVENCAPI_VERSION;
+    params.device     = ctx->cu_context;
+    params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+
+    ret = p_nvenc->nvEncOpenEncodeSessionEx(&params, &ctx->nvencoder);
+    if (ret != NV_ENC_SUCCESS) {
+        ctx->nvencoder = NULL;
+        return nvenc_print_error(avctx, ret, "OpenEncodeSessionEx failed");
+    }
+
+    return 0;
+}
+
+static int nvenc_check_codec_support(AVCodecContext *avctx)
+{
+    NvencContext *ctx = avctx->priv_data;
+    NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &ctx->nvenc_dload_funcs.nvenc_funcs;
+    int i, ret, count = 0;
+    GUID *guids = NULL;
+
+    ret = p_nvenc->nvEncGetEncodeGUIDCount(ctx->nvencoder, &count);
+
+    if (ret != NV_ENC_SUCCESS || !count)
+        return AVERROR(ENOSYS);
+
+    guids = av_malloc(count * sizeof(GUID));
+    if (!guids)
+        return AVERROR(ENOMEM);
+
+    ret = p_nvenc->nvEncGetEncodeGUIDs(ctx->nvencoder, guids, count, &count);
+    if (ret != NV_ENC_SUCCESS) {
+        ret = AVERROR(ENOSYS);
+        goto fail;
+    }
+
+    ret = AVERROR(ENOSYS);
+    for (i = 0; i < count; i++) {
+        if (!memcmp(&guids[i], &ctx->init_encode_params.encodeGUID, sizeof(*guids))) {
+            ret = 0;
+            break;
+        }
+    }
+
+fail:
+    av_free(guids);
+
+    return ret;
+}
+
+static int nvenc_check_cap(AVCodecContext *avctx, NV_ENC_CAPS cap)
+{
+    NvencContext *ctx = avctx->priv_data;
+    NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &ctx->nvenc_dload_funcs.nvenc_funcs;
+    NV_ENC_CAPS_PARAM params        = { 0 };
+    int ret, val = 0;
+
+    params.version     = NV_ENC_CAPS_PARAM_VER;
+    params.capsToQuery = cap;
+
+    ret = p_nvenc->nvEncGetEncodeCaps(ctx->nvencoder, ctx->init_encode_params.encodeGUID, &params, &val);
+
+    if (ret == NV_ENC_SUCCESS)
+        return val;
+    return 0;
+}
+
+static int nvenc_check_capabilities(AVCodecContext *avctx)
+{
+    NvencContext *ctx = avctx->priv_data;
+    int ret;
+
+    ret = nvenc_check_codec_support(avctx);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_VERBOSE, "Codec not supported\n");
+        return ret;
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
+    if (IS_YUV444(ctx->data_pix_fmt) && ret <= 0) {
+        av_log(avctx, AV_LOG_VERBOSE, "YUV444P not supported\n");
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_SUPPORT_LOSSLESS_ENCODE);
+    if (ctx->preset >= PRESET_LOSSLESS_DEFAULT && ret <= 0) {
+        av_log(avctx, AV_LOG_VERBOSE, "Lossless encoding not supported\n");
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_WIDTH_MAX);
+    if (ret < avctx->width) {
+        av_log(avctx, AV_LOG_VERBOSE, "Width %d exceeds %d\n",
+               avctx->width, ret);
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_HEIGHT_MAX);
+    if (ret < avctx->height) {
+        av_log(avctx, AV_LOG_VERBOSE, "Height %d exceeds %d\n",
+               avctx->height, ret);
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_NUM_MAX_BFRAMES);
+    if (ret < avctx->max_b_frames) {
+        av_log(avctx, AV_LOG_VERBOSE, "Max B-frames %d exceed %d\n",
+               avctx->max_b_frames, ret);
+
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_SUPPORT_FIELD_ENCODING);
+    if (ret < 1 && avctx->flags & AV_CODEC_FLAG_INTERLACED_DCT) {
+        av_log(avctx, AV_LOG_VERBOSE,
+               "Interlaced encoding is not supported. Supported level: %d\n",
+               ret);
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_SUPPORT_10BIT_ENCODE);
+    if (IS_10BIT(ctx->data_pix_fmt) && ret <= 0) {
+        av_log(avctx, AV_LOG_VERBOSE, "10 bit encode not supported\n");
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_SUPPORT_LOOKAHEAD);
+    if (ctx->rc_lookahead > 0 && ret <= 0) {
+        av_log(avctx, AV_LOG_VERBOSE, "RC lookahead not supported\n");
+        return AVERROR(ENOSYS);
+    }
+
+    return 0;
+}
+
+static av_cold int nvenc_check_device(AVCodecContext *avctx, int idx)
 {
     NvencContext *ctx = avctx->priv_data;
     NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
+    NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
+    char name[128] = { 0};
+    int major, minor, ret;
+    CUresult cu_res;
+    CUdevice cu_device;
+    CUcontext dummy;
+    int loglevel = AV_LOG_VERBOSE;
 
-    DL_CLOSE_FUNC(dl_fn->nvenc_lib);
-    dl_fn->nvenc_lib = NULL;
+    if (ctx->device == LIST_DEVICES)
+        loglevel = AV_LOG_INFO;
 
-    dl_fn->nvenc_device_count = 0;
+    cu_res = dl_fn->cu_device_get(&cu_device, idx);
+    if (cu_res != CUDA_SUCCESS) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Cannot access the CUDA device %d\n",
+               idx);
+        return -1;
+    }
 
-#if !CONFIG_CUDA
-    DL_CLOSE_FUNC(dl_fn->cuda_lib);
-    dl_fn->cuda_lib = NULL;
-#endif
+    cu_res = dl_fn->cu_device_get_name(name, sizeof(name), cu_device);
+    if (cu_res != CUDA_SUCCESS)
+        return -1;
 
-    dl_fn->cu_init = NULL;
-    dl_fn->cu_device_get_count = NULL;
-    dl_fn->cu_device_get = NULL;
-    dl_fn->cu_device_get_name = NULL;
-    dl_fn->cu_device_compute_capability = NULL;
-    dl_fn->cu_ctx_create = NULL;
-    dl_fn->cu_ctx_pop_current = NULL;
-    dl_fn->cu_ctx_destroy = NULL;
+    cu_res = dl_fn->cu_device_compute_capability(&major, &minor, cu_device);
+    if (cu_res != CUDA_SUCCESS)
+        return -1;
 
-    av_log(avctx, AV_LOG_VERBOSE, "Nvenc unloaded\n");
+    av_log(avctx, loglevel, "[ GPU #%d - < %s > has Compute SM %d.%d ]\n", idx, name, major, minor);
+    if (((major << 4) | minor) < NVENC_CAP) {
+        av_log(avctx, loglevel, "does not support NVENC\n");
+        goto fail;
+    }
+
+    cu_res = dl_fn->cu_ctx_create(&ctx->cu_context_internal, 0, cu_device);
+    if (cu_res != CUDA_SUCCESS) {
+        av_log(avctx, AV_LOG_FATAL, "Failed creating CUDA context for NVENC: 0x%x\n", (int)cu_res);
+        goto fail;
+    }
+
+    ctx->cu_context = ctx->cu_context_internal;
+
+    cu_res = dl_fn->cu_ctx_pop_current(&dummy);
+    if (cu_res != CUDA_SUCCESS) {
+        av_log(avctx, AV_LOG_FATAL, "Failed popping CUDA context: 0x%x\n", (int)cu_res);
+        goto fail2;
+    }
+
+    if ((ret = nvenc_open_session(avctx)) < 0)
+        goto fail2;
+
+    if ((ret = nvenc_check_capabilities(avctx)) < 0)
+        goto fail3;
+
+    av_log(avctx, loglevel, "supports NVENC\n");
+
+    dl_fn->nvenc_device_count++;
+
+    if (ctx->device == dl_fn->nvenc_device_count - 1 || ctx->device == ANY_DEVICE)
+        return 0;
+
+fail3:
+    p_nvenc->nvEncDestroyEncoder(ctx->nvencoder);
+    ctx->nvencoder = NULL;
+
+fail2:
+    dl_fn->cu_ctx_destroy(ctx->cu_context_internal);
+    ctx->cu_context_internal = NULL;
+
+fail:
+    return AVERROR(ENOSYS);
 }
 
 static av_cold int nvenc_setup_device(AVCodecContext *avctx)
@@ -549,118 +440,241 @@ static av_cold int nvenc_setup_device(AVCodecContext *avctx)
     NvencContext *ctx = avctx->priv_data;
     NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
 
-    CUresult cu_res;
-    CUcontext cu_context_curr;
+    switch (avctx->codec->id) {
+    case AV_CODEC_ID_H264:
+        ctx->init_encode_params.encodeGUID = NV_ENC_CODEC_H264_GUID;
+        break;
+    case AV_CODEC_ID_HEVC:
+        ctx->init_encode_params.encodeGUID = NV_ENC_CODEC_HEVC_GUID;
+        break;
+    default:
+        return AVERROR_BUG;
+    }
 
-    ctx->data_pix_fmt = avctx->pix_fmt;
-
-#if CONFIG_CUDA
     if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
-        AVHWFramesContext *frames_ctx;
+#if CONFIG_CUDA
+        AVHWFramesContext   *frames_ctx;
         AVCUDADeviceContext *device_hwctx;
+        int ret;
 
-        if (!avctx->hw_frames_ctx) {
-            av_log(avctx, AV_LOG_ERROR, "hw_frames_ctx must be set when using GPU frames as input\n");
+        if (!avctx->hw_frames_ctx)
             return AVERROR(EINVAL);
+
+        frames_ctx   = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
+        device_hwctx = frames_ctx->device_ctx->hwctx;
+
+        ctx->cu_context = device_hwctx->cuda_ctx;
+
+        ret = nvenc_open_session(avctx);
+        if (ret < 0)
+            return ret;
+
+        ret = nvenc_check_capabilities(avctx);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_FATAL, "Provided device doesn't support required NVENC features\n");
+            return ret;
+        }
+#else
+        return AVERROR_BUG;
+#endif
+    } else {
+        int i, nb_devices = 0;
+
+        if ((dl_fn->cu_init(0)) != CUDA_SUCCESS) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Cannot init CUDA\n");
+            return AVERROR_UNKNOWN;
         }
 
-        frames_ctx = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
-        device_hwctx = frames_ctx->device_ctx->hwctx;
-        ctx->cu_context = device_hwctx->cuda_ctx;
-        ctx->data_pix_fmt = frames_ctx->sw_format;
-        return 0;
-    }
-#endif
+        if ((dl_fn->cu_device_get_count(&nb_devices)) != CUDA_SUCCESS) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Cannot enumerate the CUDA devices\n");
+            return AVERROR_UNKNOWN;
+        }
 
-    if (ctx->gpu >= dl_fn->nvenc_device_count) {
-        av_log(avctx, AV_LOG_FATAL, "Requested GPU %d, but only %d GPUs are available!\n", ctx->gpu, dl_fn->nvenc_device_count);
+        if (!nb_devices) {
+            av_log(avctx, AV_LOG_FATAL, "No CUDA capable devices found\n");
+                return AVERROR_EXTERNAL;
+        }
+
+        av_log(avctx, AV_LOG_VERBOSE, "%d CUDA capable devices found\n", nb_devices);
+
+        dl_fn->nvenc_device_count = 0;
+        for (i = 0; i < nb_devices; ++i) {
+            if ((nvenc_check_device(avctx, i)) >= 0 && ctx->device != LIST_DEVICES)
+                return 0;
+        }
+
+        if (ctx->device == LIST_DEVICES)
+            return AVERROR_EXIT;
+
+        if (!dl_fn->nvenc_device_count) {
+            av_log(avctx, AV_LOG_FATAL, "No NVENC capable devices found\n");
+            return AVERROR_EXTERNAL;
+        }
+
+        av_log(avctx, AV_LOG_FATAL, "Requested GPU %d, but only %d GPUs are available!\n", ctx->device, dl_fn->nvenc_device_count);
         return AVERROR(EINVAL);
     }
 
-    ctx->cu_context = NULL;
-    cu_res = dl_fn->cu_ctx_create(&ctx->cu_context_internal, 4, dl_fn->nvenc_devices[ctx->gpu]); // CU_CTX_SCHED_BLOCKING_SYNC=4, avoid CPU spins
-
-    if (cu_res != CUDA_SUCCESS) {
-        av_log(avctx, AV_LOG_FATAL, "Failed creating CUDA context for NVENC: 0x%x\n", (int)cu_res);
-        return AVERROR_EXTERNAL;
-    }
-
-    cu_res = dl_fn->cu_ctx_pop_current(&cu_context_curr);
-
-    if (cu_res != CUDA_SUCCESS) {
-        av_log(avctx, AV_LOG_FATAL, "Failed popping CUDA context: 0x%x\n", (int)cu_res);
-        return AVERROR_EXTERNAL;
-    }
-
-    ctx->cu_context = ctx->cu_context_internal;
-
     return 0;
 }
 
-static av_cold int nvenc_open_session(AVCodecContext *avctx)
+typedef struct GUIDTuple {
+    const GUID guid;
+    int flags;
+} GUIDTuple;
+
+#define PRESET_ALIAS(alias, name, ...) \
+    [PRESET_ ## alias] = { NV_ENC_PRESET_ ## name ## _GUID, __VA_ARGS__ }
+
+#define PRESET(name, ...) PRESET_ALIAS(name, name, __VA_ARGS__)
+
+static void nvenc_map_preset(NvencContext *ctx)
 {
-    NvencContext *ctx = avctx->priv_data;
-    NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
-    NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
+    GUIDTuple presets[] = {
+        PRESET(DEFAULT),
+        PRESET(HP),
+        PRESET(HQ),
+        PRESET(BD),
+        PRESET_ALIAS(SLOW,   HQ,    NVENC_TWO_PASSES),
+        PRESET_ALIAS(MEDIUM, HQ,    NVENC_ONE_PASS),
+        PRESET_ALIAS(FAST,   HP,    NVENC_ONE_PASS),
+        PRESET(LOW_LATENCY_DEFAULT, NVENC_LOWLATENCY),
+        PRESET(LOW_LATENCY_HP,      NVENC_LOWLATENCY),
+        PRESET(LOW_LATENCY_HQ,      NVENC_LOWLATENCY),
+        PRESET(LOSSLESS_DEFAULT,    NVENC_LOSSLESS),
+        PRESET(LOSSLESS_HP,         NVENC_LOSSLESS),
+    };
 
-    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS encode_session_params = { 0 };
-    NVENCSTATUS nv_status;
+    GUIDTuple *t = &presets[ctx->preset];
 
-    encode_session_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
-    encode_session_params.apiVersion = NVENCAPI_VERSION;
-    encode_session_params.device = ctx->cu_context;
-    encode_session_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
-
-    nv_status = p_nvenc->nvEncOpenEncodeSessionEx(&encode_session_params, &ctx->nvencoder);
-    if (nv_status != NV_ENC_SUCCESS) {
-        ctx->nvencoder = NULL;
-        return nvenc_print_error(avctx, nv_status, "OpenEncodeSessionEx failed");
-    }
-
-    return 0;
+    ctx->init_encode_params.presetGUID = t->guid;
+    ctx->flags = t->flags;
 }
+
+#undef PRESET
+#undef PRESET_ALIAS
 
 static av_cold void set_constqp(AVCodecContext *avctx)
 {
     NvencContext *ctx = avctx->priv_data;
+    NV_ENC_RC_PARAMS *rc = &ctx->encode_config.rcParams;
 
-    ctx->encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
-    ctx->encode_config.rcParams.constQP.qpInterB = avctx->global_quality;
-    ctx->encode_config.rcParams.constQP.qpInterP = avctx->global_quality;
-    ctx->encode_config.rcParams.constQP.qpIntra = avctx->global_quality;
+    rc->rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+    rc->constQP.qpInterB = avctx->global_quality;
+    rc->constQP.qpInterP = avctx->global_quality;
+    rc->constQP.qpIntra = avctx->global_quality;
+
+    avctx->qmin = -1;
+    avctx->qmax = -1;
 }
 
 static av_cold void set_vbr(AVCodecContext *avctx)
 {
     NvencContext *ctx = avctx->priv_data;
+    NV_ENC_RC_PARAMS *rc = &ctx->encode_config.rcParams;
+    int qp_inter_p;
 
-    ctx->encode_config.rcParams.enableMinQP = 1;
-    ctx->encode_config.rcParams.enableMaxQP = 1;
+    if (avctx->qmin >= 0 && avctx->qmax >= 0) {
+        rc->enableMinQP = 1;
+        rc->enableMaxQP = 1;
 
-    ctx->encode_config.rcParams.minQP.qpInterB = avctx->qmin;
-    ctx->encode_config.rcParams.minQP.qpInterP = avctx->qmin;
-    ctx->encode_config.rcParams.minQP.qpIntra = avctx->qmin;
+        rc->minQP.qpInterB = avctx->qmin;
+        rc->minQP.qpInterP = avctx->qmin;
+        rc->minQP.qpIntra = avctx->qmin;
 
-    ctx->encode_config.rcParams.maxQP.qpInterB = avctx->qmax;
-    ctx->encode_config.rcParams.maxQP.qpInterP = avctx->qmax;
-    ctx->encode_config.rcParams.maxQP.qpIntra = avctx->qmax;
+        rc->maxQP.qpInterB = avctx->qmax;
+        rc->maxQP.qpInterP = avctx->qmax;
+        rc->maxQP.qpIntra = avctx->qmax;
+
+        qp_inter_p = (avctx->qmax + 3 * avctx->qmin) / 4; // biased towards Qmin
+    } else if (avctx->qmin >= 0) {
+        rc->enableMinQP = 1;
+
+        rc->minQP.qpInterB = avctx->qmin;
+        rc->minQP.qpInterP = avctx->qmin;
+        rc->minQP.qpIntra = avctx->qmin;
+
+        qp_inter_p = avctx->qmin;
+    } else {
+        qp_inter_p = 26; // default to 26
+    }
+
+    rc->enableInitialRCQP = 1;
+    rc->initialRCQP.qpInterP  = qp_inter_p;
+
+    if (avctx->i_quant_factor != 0.0 && avctx->b_quant_factor != 0.0) {
+        rc->initialRCQP.qpIntra = av_clip(
+            qp_inter_p * fabs(avctx->i_quant_factor) + avctx->i_quant_offset, 0, 51);
+        rc->initialRCQP.qpInterB = av_clip(
+            qp_inter_p * fabs(avctx->b_quant_factor) + avctx->b_quant_offset, 0, 51);
+    } else {
+        rc->initialRCQP.qpIntra = qp_inter_p;
+        rc->initialRCQP.qpInterB = qp_inter_p;
+    }
 }
 
 static av_cold void set_lossless(AVCodecContext *avctx)
 {
     NvencContext *ctx = avctx->priv_data;
+    NV_ENC_RC_PARAMS *rc = &ctx->encode_config.rcParams;
 
-    ctx->encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
-    ctx->encode_config.rcParams.constQP.qpInterB = 0;
-    ctx->encode_config.rcParams.constQP.qpInterP = 0;
-    ctx->encode_config.rcParams.constQP.qpIntra = 0;
+    rc->rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+    rc->constQP.qpInterB = 0;
+    rc->constQP.qpInterP = 0;
+    rc->constQP.qpIntra = 0;
+
+    avctx->qmin = -1;
+    avctx->qmax = -1;
 }
 
-static av_cold void nvenc_setup_rate_control(AVCodecContext *avctx, int lossless)
+static void nvenc_override_rate_control(AVCodecContext *avctx)
+{
+    NvencContext *ctx    = avctx->priv_data;
+    NV_ENC_RC_PARAMS *rc = &ctx->encode_config.rcParams;
+
+    switch (ctx->rc) {
+    case NV_ENC_PARAMS_RC_CONSTQP:
+        if (avctx->global_quality <= 0) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "The constant quality rate-control requires "
+                   "the 'global_quality' option set.\n");
+            return;
+        }
+        set_constqp(avctx);
+        return;
+    case NV_ENC_PARAMS_RC_2_PASS_VBR:
+    case NV_ENC_PARAMS_RC_VBR:
+        if (avctx->qmin < 0 && avctx->qmax < 0) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "The variable bitrate rate-control requires "
+                   "the 'qmin' and/or 'qmax' option set.\n");
+            set_vbr(avctx);
+            return;
+        }
+    case NV_ENC_PARAMS_RC_VBR_MINQP:
+        if (avctx->qmin < 0) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "The variable bitrate rate-control requires "
+                   "the 'qmin' option set.\n");
+            set_vbr(avctx);
+            return;
+        }
+        set_vbr(avctx);
+        break;
+    case NV_ENC_PARAMS_RC_CBR:
+    case NV_ENC_PARAMS_RC_2_PASS_QUALITY:
+    case NV_ENC_PARAMS_RC_2_PASS_FRAMESIZE_CAP:
+        break;
+    }
+
+    rc->rateControlMode = ctx->rc;
+}
+
+static av_cold void nvenc_setup_rate_control(AVCodecContext *avctx)
 {
     NvencContext *ctx = avctx->priv_data;
-
-    int qp_inter_p;
 
     if (avctx->bit_rate > 0) {
         ctx->encode_config.rcParams.averageBitRate = avctx->bit_rate;
@@ -671,75 +685,37 @@ static av_cold void nvenc_setup_rate_control(AVCodecContext *avctx, int lossless
     if (avctx->rc_max_rate > 0)
         ctx->encode_config.rcParams.maxBitRate = avctx->rc_max_rate;
 
-    if (lossless) {
-        if (avctx->codec->id == AV_CODEC_ID_H264)
-            ctx->encode_config.encodeCodecConfig.h264Config.qpPrimeYZeroTransformBypassFlag = 1;
+    if (ctx->rc < 0) {
+        if (ctx->flags & NVENC_ONE_PASS)
+            ctx->twopass = 0;
+        if (ctx->flags & NVENC_TWO_PASSES)
+            ctx->twopass = 1;
 
+        if (ctx->twopass < 0)
+            ctx->twopass = (ctx->flags & NVENC_LOWLATENCY) != 0;
+
+        if (ctx->cbr) {
+            if (ctx->twopass) {
+                ctx->rc = NV_ENC_PARAMS_RC_2_PASS_QUALITY;
+            } else {
+                ctx->rc = NV_ENC_PARAMS_RC_CBR;
+            }
+        } else if (avctx->global_quality > 0) {
+            ctx->rc = NV_ENC_PARAMS_RC_CONSTQP;
+        } else if (ctx->twopass) {
+            ctx->rc = NV_ENC_PARAMS_RC_2_PASS_VBR;
+        } else if (avctx->qmin >= 0 && avctx->qmax >= 0) {
+            ctx->rc = NV_ENC_PARAMS_RC_VBR_MINQP;
+        }
+    }
+
+    if (ctx->flags & NVENC_LOSSLESS) {
         set_lossless(avctx);
-
-        avctx->qmin = -1;
-        avctx->qmax = -1;
-    } else if (ctx->cbr) {
-        if (!ctx->twopass) {
-            ctx->encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-        } else {
-            ctx->encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_2_PASS_QUALITY;
-
-            if (avctx->codec->id == AV_CODEC_ID_H264) {
-                ctx->encode_config.encodeCodecConfig.h264Config.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
-                ctx->encode_config.encodeCodecConfig.h264Config.fmoMode = NV_ENC_H264_FMO_DISABLE;
-            }
-        }
-
-        if (avctx->codec->id == AV_CODEC_ID_H264) {
-            ctx->encode_config.encodeCodecConfig.h264Config.outputBufferingPeriodSEI = 1;
-            ctx->encode_config.encodeCodecConfig.h264Config.outputPictureTimingSEI = 1;
-        } else if (avctx->codec->id == AV_CODEC_ID_H265) {
-            ctx->encode_config.encodeCodecConfig.hevcConfig.outputBufferingPeriodSEI = 1;
-            ctx->encode_config.encodeCodecConfig.hevcConfig.outputPictureTimingSEI = 1;
-        }
-    } else if (avctx->global_quality > 0) {
-        set_constqp(avctx);
-
-        avctx->qmin = -1;
-        avctx->qmax = -1;
+    } else if (ctx->rc >= 0) {
+        nvenc_override_rate_control(avctx);
     } else {
-        if (avctx->qmin >= 0 && avctx->qmax >= 0) {
-            set_vbr(avctx);
-
-            qp_inter_p = (avctx->qmax + 3 * avctx->qmin) / 4; // biased towards Qmin
-
-            if (ctx->twopass) {
-                ctx->encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_2_PASS_VBR;
-                if (avctx->codec->id == AV_CODEC_ID_H264) {
-                    ctx->encode_config.encodeCodecConfig.h264Config.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
-                    ctx->encode_config.encodeCodecConfig.h264Config.fmoMode = NV_ENC_H264_FMO_DISABLE;
-                }
-            } else {
-                ctx->encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR_MINQP;
-            }
-        } else {
-            qp_inter_p = 26; // default to 26
-
-            if (ctx->twopass) {
-                ctx->encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_2_PASS_VBR;
-            } else {
-                ctx->encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
-            }
-        }
-
-        ctx->encode_config.rcParams.enableInitialRCQP = 1;
-        ctx->encode_config.rcParams.initialRCQP.qpInterP  = qp_inter_p;
-
-        if (avctx->i_quant_factor != 0.0 && avctx->b_quant_factor != 0.0) {
-            ctx->encode_config.rcParams.initialRCQP.qpIntra = av_clip(
-                qp_inter_p * fabs(avctx->i_quant_factor) + avctx->i_quant_offset, 0, 51);
-            ctx->encode_config.rcParams.initialRCQP.qpInterB = av_clip(
-                qp_inter_p * fabs(avctx->b_quant_factor) + avctx->b_quant_offset, 0, 51);
-        } else {
-            ctx->encode_config.rcParams.initialRCQP.qpIntra = qp_inter_p;
-            ctx->encode_config.rcParams.initialRCQP.qpInterB = qp_inter_p;
-        }
+        ctx->encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+        set_vbr(avctx);
     }
 
     if (avctx->rc_buffer_size > 0) {
@@ -747,158 +723,222 @@ static av_cold void nvenc_setup_rate_control(AVCodecContext *avctx, int lossless
     } else if (ctx->encode_config.rcParams.averageBitRate > 0) {
         ctx->encode_config.rcParams.vbvBufferSize = 2 * ctx->encode_config.rcParams.averageBitRate;
     }
+
+    if (ctx->aq) {
+        ctx->encode_config.rcParams.enableAQ   = 1;
+        ctx->encode_config.rcParams.aqStrength = ctx->aq_strength;
+        av_log(avctx, AV_LOG_VERBOSE, "AQ enabled.\n");
+    }
+
+    if (ctx->temporal_aq) {
+        ctx->encode_config.rcParams.enableTemporalAQ = 1;
+        av_log(avctx, AV_LOG_VERBOSE, "Temporal AQ enabled.\n");
+    }
+
+    if (ctx->rc_lookahead) {
+        int lkd_bound = FFMIN(ctx->nb_surfaces, ctx->async_depth) -
+                        ctx->encode_config.frameIntervalP - 4;
+
+        if (lkd_bound < 0) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "Lookahead not enabled. Increase buffer delay (-delay).\n");
+        } else {
+            ctx->encode_config.rcParams.enableLookahead = 1;
+            ctx->encode_config.rcParams.lookaheadDepth  = av_clip(ctx->rc_lookahead, 0, lkd_bound);
+            ctx->encode_config.rcParams.disableIadapt   = ctx->no_scenecut;
+            ctx->encode_config.rcParams.disableBadapt   = !ctx->b_adapt;
+            av_log(avctx, AV_LOG_VERBOSE,
+                   "Lookahead enabled: depth %d, scenecut %s, B-adapt %s.\n",
+                   ctx->encode_config.rcParams.lookaheadDepth,
+                   ctx->encode_config.rcParams.disableIadapt ? "disabled" : "enabled",
+                   ctx->encode_config.rcParams.disableBadapt ? "disabled" : "enabled");
+        }
+    }
+
+    if (ctx->strict_gop) {
+        ctx->encode_config.rcParams.strictGOPTarget = 1;
+        av_log(avctx, AV_LOG_VERBOSE, "Strict GOP target enabled.\n");
+    }
+
+    if (ctx->nonref_p)
+        ctx->encode_config.rcParams.enableNonRefP = 1;
+
+    if (ctx->zerolatency)
+        ctx->encode_config.rcParams.zeroReorderDelay = 1;
+
+    if (ctx->quality)
+        ctx->encode_config.rcParams.targetQuality = ctx->quality;
 }
 
-static av_cold int nvenc_setup_h264_config(AVCodecContext *avctx, int lossless)
+static av_cold int nvenc_setup_h264_config(AVCodecContext *avctx)
 {
-    NvencContext *ctx = avctx->priv_data;
-    int res;
+    NvencContext *ctx                      = avctx->priv_data;
+    NV_ENC_CONFIG *cc                      = &ctx->encode_config;
+    NV_ENC_CONFIG_H264 *h264               = &cc->encodeCodecConfig.h264Config;
+    NV_ENC_CONFIG_H264_VUI_PARAMETERS *vui = &h264->h264VUIParameters;
 
-    ctx->encode_config.encodeCodecConfig.h264Config.h264VUIParameters.colourMatrix = avctx->colorspace;
-    ctx->encode_config.encodeCodecConfig.h264Config.h264VUIParameters.colourPrimaries = avctx->color_primaries;
-    ctx->encode_config.encodeCodecConfig.h264Config.h264VUIParameters.transferCharacteristics = avctx->color_trc;
-    ctx->encode_config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag = (avctx->color_range == AVCOL_RANGE_JPEG
+    vui->colourMatrix = avctx->colorspace;
+    vui->colourPrimaries = avctx->color_primaries;
+    vui->transferCharacteristics = avctx->color_trc;
+    vui->videoFullRangeFlag = (avctx->color_range == AVCOL_RANGE_JPEG
         || ctx->data_pix_fmt == AV_PIX_FMT_YUVJ420P || ctx->data_pix_fmt == AV_PIX_FMT_YUVJ422P || ctx->data_pix_fmt == AV_PIX_FMT_YUVJ444P);
 
-    ctx->encode_config.encodeCodecConfig.h264Config.h264VUIParameters.colourDescriptionPresentFlag =
+    vui->colourDescriptionPresentFlag =
         (avctx->colorspace != 2 || avctx->color_primaries != 2 || avctx->color_trc != 2);
 
-    ctx->encode_config.encodeCodecConfig.h264Config.h264VUIParameters.videoSignalTypePresentFlag =
-        (ctx->encode_config.encodeCodecConfig.h264Config.h264VUIParameters.colourDescriptionPresentFlag
-        || ctx->encode_config.encodeCodecConfig.h264Config.h264VUIParameters.videoFormat != 5
-        || ctx->encode_config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag != 0);
+    vui->videoSignalTypePresentFlag =
+        (vui->colourDescriptionPresentFlag
+        || vui->videoFormat != 5
+        || vui->videoFullRangeFlag != 0);
 
-    ctx->encode_config.encodeCodecConfig.h264Config.sliceMode = 3;
-    ctx->encode_config.encodeCodecConfig.h264Config.sliceModeData = 1;
+    h264->sliceMode = 3;
+    h264->sliceModeData = 1;
 
-    ctx->encode_config.encodeCodecConfig.h264Config.disableSPSPPS = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 1 : 0;
-    ctx->encode_config.encodeCodecConfig.h264Config.repeatSPSPPS = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 0 : 1;
+    h264->disableSPSPPS = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 1 : 0;
+    h264->repeatSPSPPS  = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 0 : 1;
+    h264->outputAUD     = 1;
 
-    ctx->encode_config.encodeCodecConfig.h264Config.outputAUD = 1;
+    if (avctx->refs >= 0) {
+        /* 0 means "let the hardware decide" */
+        h264->maxNumRefFrames = avctx->refs;
+    }
+    if (avctx->gop_size >= 0) {
+        h264->idrPeriod = cc->gopLength;
+    }
 
-    if (!ctx->profile && !lossless) {
-        switch (avctx->profile) {
-        case FF_PROFILE_H264_HIGH_444_PREDICTIVE:
-            ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
-            break;
-        case FF_PROFILE_H264_BASELINE:
-            ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
-            break;
-        case FF_PROFILE_H264_MAIN:
-            ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
-            break;
-        case FF_PROFILE_H264_HIGH:
-        case FF_PROFILE_UNKNOWN:
-            ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-            break;
-        default:
-            av_log(avctx, AV_LOG_WARNING, "Unsupported profile requested, falling back to high\n");
-            ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-            break;
-        }
-    } else if (!lossless) {
-        if (!strcmp(ctx->profile, "high")) {
-            ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-            avctx->profile = FF_PROFILE_H264_HIGH;
-        } else if (!strcmp(ctx->profile, "main")) {
-            ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
-            avctx->profile = FF_PROFILE_H264_MAIN;
-        } else if (!strcmp(ctx->profile, "baseline")) {
-            ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
+    if (IS_CBR(cc->rcParams.rateControlMode)) {
+        h264->outputBufferingPeriodSEI = 1;
+        h264->outputPictureTimingSEI   = 1;
+    }
+
+    if (cc->rcParams.rateControlMode == NV_ENC_PARAMS_RC_2_PASS_QUALITY ||
+        cc->rcParams.rateControlMode == NV_ENC_PARAMS_RC_2_PASS_FRAMESIZE_CAP ||
+        cc->rcParams.rateControlMode == NV_ENC_PARAMS_RC_2_PASS_VBR) {
+        h264->adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
+        h264->fmoMode = NV_ENC_H264_FMO_DISABLE;
+    }
+
+    if (ctx->flags & NVENC_LOSSLESS) {
+        h264->qpPrimeYZeroTransformBypassFlag = 1;
+    } else {
+        switch(ctx->profile) {
+        case NV_ENC_H264_PROFILE_BASELINE:
+            cc->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
             avctx->profile = FF_PROFILE_H264_BASELINE;
-        } else if (!strcmp(ctx->profile, "high444p")) {
-            ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
+            break;
+        case NV_ENC_H264_PROFILE_MAIN:
+            cc->profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
+            avctx->profile = FF_PROFILE_H264_MAIN;
+            break;
+        case NV_ENC_H264_PROFILE_HIGH:
+            cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+            avctx->profile = FF_PROFILE_H264_HIGH;
+            break;
+        case NV_ENC_H264_PROFILE_HIGH_444P:
+            cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
             avctx->profile = FF_PROFILE_H264_HIGH_444_PREDICTIVE;
-        } else {
-            av_log(avctx, AV_LOG_FATAL, "Profile \"%s\" is unknown! Supported profiles: high, main, baseline\n", ctx->profile);
-            return AVERROR(EINVAL);
+            break;
         }
     }
 
     // force setting profile as high444p if input is AV_PIX_FMT_YUV444P
     if (ctx->data_pix_fmt == AV_PIX_FMT_YUV444P) {
-        ctx->encode_config.profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
+        cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
         avctx->profile = FF_PROFILE_H264_HIGH_444_PREDICTIVE;
     }
 
-    ctx->encode_config.encodeCodecConfig.h264Config.chromaFormatIDC = avctx->profile == FF_PROFILE_H264_HIGH_444_PREDICTIVE ? 3 : 1;
+    h264->chromaFormatIDC = avctx->profile == FF_PROFILE_H264_HIGH_444_PREDICTIVE ? 3 : 1;
 
-    if (ctx->level) {
-        res = input_string_to_uint32(avctx, nvenc_h264_level_pairs, ctx->level, &ctx->encode_config.encodeCodecConfig.h264Config.level);
-
-        if (res) {
-            av_log(avctx, AV_LOG_FATAL, "Level \"%s\" is unknown! Supported levels: auto, 1, 1b, 1.1, 1.2, 1.3, 2, 2.1, 2.2, 3, 3.1, 3.2, 4, 4.1, 4.2, 5, 5.1\n", ctx->level);
-            return res;
-        }
-    } else {
-        ctx->encode_config.encodeCodecConfig.h264Config.level = NV_ENC_LEVEL_AUTOSELECT;
-    }
+    h264->level = ctx->level;
 
     return 0;
 }
 
 static av_cold int nvenc_setup_hevc_config(AVCodecContext *avctx)
 {
-    NvencContext *ctx = avctx->priv_data;
-    int res;
+    NvencContext *ctx                      = avctx->priv_data;
+    NV_ENC_CONFIG *cc                      = &ctx->encode_config;
+    NV_ENC_CONFIG_HEVC *hevc               = &cc->encodeCodecConfig.hevcConfig;
+    NV_ENC_CONFIG_HEVC_VUI_PARAMETERS *vui = &hevc->hevcVUIParameters;
 
-    ctx->encode_config.encodeCodecConfig.hevcConfig.hevcVUIParameters.colourMatrix = avctx->colorspace;
-    ctx->encode_config.encodeCodecConfig.hevcConfig.hevcVUIParameters.colourPrimaries = avctx->color_primaries;
-    ctx->encode_config.encodeCodecConfig.hevcConfig.hevcVUIParameters.transferCharacteristics = avctx->color_trc;
-    ctx->encode_config.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFullRangeFlag = (avctx->color_range == AVCOL_RANGE_JPEG
+    vui->colourMatrix = avctx->colorspace;
+    vui->colourPrimaries = avctx->color_primaries;
+    vui->transferCharacteristics = avctx->color_trc;
+    vui->videoFullRangeFlag = (avctx->color_range == AVCOL_RANGE_JPEG
         || ctx->data_pix_fmt == AV_PIX_FMT_YUVJ420P || ctx->data_pix_fmt == AV_PIX_FMT_YUVJ422P || ctx->data_pix_fmt == AV_PIX_FMT_YUVJ444P);
 
-    ctx->encode_config.encodeCodecConfig.hevcConfig.hevcVUIParameters.colourDescriptionPresentFlag =
+    vui->colourDescriptionPresentFlag =
         (avctx->colorspace != 2 || avctx->color_primaries != 2 || avctx->color_trc != 2);
 
-    ctx->encode_config.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoSignalTypePresentFlag =
-        (ctx->encode_config.encodeCodecConfig.hevcConfig.hevcVUIParameters.colourDescriptionPresentFlag
-        || ctx->encode_config.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFormat != 5
-        || ctx->encode_config.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFullRangeFlag != 0);
+    vui->videoSignalTypePresentFlag =
+        (vui->colourDescriptionPresentFlag
+        || vui->videoFormat != 5
+        || vui->videoFullRangeFlag != 0);
 
-    ctx->encode_config.encodeCodecConfig.hevcConfig.sliceMode = 3;
-    ctx->encode_config.encodeCodecConfig.hevcConfig.sliceModeData = 1;
+    hevc->sliceMode = 3;
+    hevc->sliceModeData = 1;
 
-    ctx->encode_config.encodeCodecConfig.hevcConfig.disableSPSPPS = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 1 : 0;
-    ctx->encode_config.encodeCodecConfig.hevcConfig.repeatSPSPPS = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 0 : 1;
+    hevc->disableSPSPPS = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 1 : 0;
+    hevc->repeatSPSPPS  = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 0 : 1;
+    hevc->outputAUD     = 1;
 
-    ctx->encode_config.encodeCodecConfig.hevcConfig.outputAUD = 1;
-
-    /* No other profile is supported in the current SDK version 5 */
-    ctx->encode_config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
-    avctx->profile = FF_PROFILE_HEVC_MAIN;
-
-    if (ctx->level) {
-        res = input_string_to_uint32(avctx, nvenc_hevc_level_pairs, ctx->level, &ctx->encode_config.encodeCodecConfig.hevcConfig.level);
-
-        if (res) {
-            av_log(avctx, AV_LOG_FATAL, "Level \"%s\" is unknown! Supported levels: auto, 1, 2, 2.1, 3, 3.1, 4, 4.1, 5, 5.1, 5.2, 6, 6.1, 6.2\n", ctx->level);
-            return res;
-        }
-    } else {
-        ctx->encode_config.encodeCodecConfig.hevcConfig.level = NV_ENC_LEVEL_AUTOSELECT;
+    if (avctx->refs >= 0) {
+        /* 0 means "let the hardware decide" */
+        hevc->maxNumRefFramesInDPB = avctx->refs;
+    }
+    if (avctx->gop_size >= 0) {
+        hevc->idrPeriod = cc->gopLength;
     }
 
-    if (ctx->tier) {
-        if (!strcmp(ctx->tier, "main")) {
-            ctx->encode_config.encodeCodecConfig.hevcConfig.tier = NV_ENC_TIER_HEVC_MAIN;
-        } else if (!strcmp(ctx->tier, "high")) {
-            ctx->encode_config.encodeCodecConfig.hevcConfig.tier = NV_ENC_TIER_HEVC_HIGH;
-        } else {
-            av_log(avctx, AV_LOG_FATAL, "Tier \"%s\" is unknown! Supported tiers: main, high\n", ctx->tier);
-            return AVERROR(EINVAL);
-        }
+    if (IS_CBR(cc->rcParams.rateControlMode)) {
+        hevc->outputBufferingPeriodSEI = 1;
+        hevc->outputPictureTimingSEI   = 1;
     }
+
+    switch(ctx->profile) {
+    case NV_ENC_HEVC_PROFILE_MAIN:
+        cc->profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+        avctx->profile = FF_PROFILE_HEVC_MAIN;
+        break;
+    case NV_ENC_HEVC_PROFILE_MAIN_10:
+        cc->profileGUID = NV_ENC_HEVC_PROFILE_MAIN10_GUID;
+        avctx->profile = FF_PROFILE_HEVC_MAIN_10;
+        break;
+    case NV_ENC_HEVC_PROFILE_REXT:
+        cc->profileGUID = NV_ENC_HEVC_PROFILE_FREXT_GUID;
+        avctx->profile = FF_PROFILE_HEVC_REXT;
+        break;
+    }
+
+    // force setting profile as main10 if input is 10 bit
+    if (IS_10BIT(ctx->data_pix_fmt)) {
+        cc->profileGUID = NV_ENC_HEVC_PROFILE_MAIN10_GUID;
+        avctx->profile = FF_PROFILE_HEVC_MAIN_10;
+    }
+
+    // force setting profile as rext if input is yuv444
+    if (IS_YUV444(ctx->data_pix_fmt)) {
+        cc->profileGUID = NV_ENC_HEVC_PROFILE_FREXT_GUID;
+        avctx->profile = FF_PROFILE_HEVC_REXT;
+    }
+
+    hevc->chromaFormatIDC = IS_YUV444(ctx->data_pix_fmt) ? 3 : 1;
+
+    hevc->pixelBitDepthMinus8 = IS_10BIT(ctx->data_pix_fmt) ? 2 : 0;
+
+    hevc->level = ctx->level;
+
+    hevc->tier = ctx->tier;
 
     return 0;
 }
 
-static av_cold int nvenc_setup_codec_config(AVCodecContext *avctx, int lossless)
+static av_cold int nvenc_setup_codec_config(AVCodecContext *avctx)
 {
     switch (avctx->codec->id) {
     case AV_CODEC_ID_H264:
-        return nvenc_setup_h264_config(avctx, lossless);
-    case AV_CODEC_ID_H265:
+        return nvenc_setup_h264_config(avctx);
+    case AV_CODEC_ID_HEVC:
         return nvenc_setup_hevc_config(avctx);
     /* Earlier switch/case will return if unknown codec is passed. */
     }
@@ -913,86 +953,34 @@ static av_cold int nvenc_setup_encoder(AVCodecContext *avctx)
     NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
 
     NV_ENC_PRESET_CONFIG preset_config = { 0 };
-    GUID encoder_preset = NV_ENC_PRESET_HQ_GUID;
-    GUID codec;
     NVENCSTATUS nv_status = NV_ENC_SUCCESS;
     AVCPBProperties *cpb_props;
-    int num_mbs;
-    int isLL = 0;
-    int lossless = 0;
     int res = 0;
     int dw, dh;
 
-    ctx->last_dts = AV_NOPTS_VALUE;
-
     ctx->encode_config.version = NV_ENC_CONFIG_VER;
     ctx->init_encode_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
+
+    ctx->init_encode_params.encodeHeight = avctx->height;
+    ctx->init_encode_params.encodeWidth = avctx->width;
+
+    ctx->init_encode_params.encodeConfig = &ctx->encode_config;
+
+    nvenc_map_preset(ctx);
+
     preset_config.version = NV_ENC_PRESET_CONFIG_VER;
     preset_config.presetCfg.version = NV_ENC_CONFIG_VER;
 
-    if (ctx->preset) {
-        if (!strcmp(ctx->preset, "slow")) {
-            encoder_preset = NV_ENC_PRESET_HQ_GUID;
-            ctx->twopass = 1;
-        } else if (!strcmp(ctx->preset, "medium")) {
-            encoder_preset = NV_ENC_PRESET_HQ_GUID;
-            ctx->twopass = 0;
-        } else if (!strcmp(ctx->preset, "fast")) {
-            encoder_preset = NV_ENC_PRESET_HP_GUID;
-            ctx->twopass = 0;
-        } else if (!strcmp(ctx->preset, "hq")) {
-            encoder_preset = NV_ENC_PRESET_HQ_GUID;
-        } else if (!strcmp(ctx->preset, "hp")) {
-            encoder_preset = NV_ENC_PRESET_HP_GUID;
-        } else if (!strcmp(ctx->preset, "bd")) {
-            encoder_preset = NV_ENC_PRESET_BD_GUID;
-        } else if (!strcmp(ctx->preset, "ll")) {
-            encoder_preset = NV_ENC_PRESET_LOW_LATENCY_DEFAULT_GUID;
-            isLL = 1;
-        } else if (!strcmp(ctx->preset, "llhp")) {
-            encoder_preset = NV_ENC_PRESET_LOW_LATENCY_HP_GUID;
-            isLL = 1;
-        } else if (!strcmp(ctx->preset, "llhq")) {
-            encoder_preset = NV_ENC_PRESET_LOW_LATENCY_HQ_GUID;
-            isLL = 1;
-        } else if (!strcmp(ctx->preset, "lossless")) {
-            encoder_preset = NV_ENC_PRESET_LOSSLESS_DEFAULT_GUID;
-            lossless = 1;
-        } else if (!strcmp(ctx->preset, "losslesshp")) {
-            encoder_preset = NV_ENC_PRESET_LOSSLESS_HP_GUID;
-            lossless = 1;
-        } else if (!strcmp(ctx->preset, "default")) {
-            encoder_preset = NV_ENC_PRESET_DEFAULT_GUID;
-        } else {
-            av_log(avctx, AV_LOG_FATAL, "Preset \"%s\" is unknown! Supported presets: slow, medium, fast, hp, hq, bd, ll, llhp, llhq, lossless, losslesshp, default\n", ctx->preset);
-            return AVERROR(EINVAL);
-        }
-    }
+    nv_status = p_nvenc->nvEncGetEncodePresetConfig(ctx->nvencoder,
+                                                    ctx->init_encode_params.encodeGUID,
+                                                    ctx->init_encode_params.presetGUID,
+                                                    &preset_config);
+    if (nv_status != NV_ENC_SUCCESS)
+        return nvenc_print_error(avctx, nv_status, "Cannot get the preset configuration");
 
-    if (ctx->twopass < 0) {
-        ctx->twopass = isLL;
-    }
+    memcpy(&ctx->encode_config, &preset_config.presetCfg, sizeof(ctx->encode_config));
 
-    switch (avctx->codec->id) {
-    case AV_CODEC_ID_H264:
-        codec = NV_ENC_CODEC_H264_GUID;
-        break;
-    case AV_CODEC_ID_H265:
-        codec = NV_ENC_CODEC_HEVC_GUID;
-        break;
-    default:
-        av_log(avctx, AV_LOG_ERROR, "Unknown codec name\n");
-        return AVERROR(EINVAL);
-    }
-
-    nv_status = p_nvenc->nvEncGetEncodePresetConfig(ctx->nvencoder, codec, encoder_preset, &preset_config);
-    if (nv_status != NV_ENC_SUCCESS) {
-        return nvenc_print_error(avctx, nv_status, "GetEncodePresetConfig failed");
-    }
-
-    ctx->init_encode_params.encodeGUID = codec;
-    ctx->init_encode_params.encodeHeight = avctx->height;
-    ctx->init_encode_params.encodeWidth = avctx->width;
+    ctx->encode_config.version = NV_ENC_CONFIG_VER;
 
     if (avctx->sample_aspect_ratio.num && avctx->sample_aspect_ratio.den &&
         (avctx->sample_aspect_ratio.num != 1 || avctx->sample_aspect_ratio.num != 1)) {
@@ -1022,69 +1010,25 @@ static av_cold int nvenc_setup_encoder(AVCodecContext *avctx)
     ctx->init_encode_params.frameRateNum = avctx->time_base.den;
     ctx->init_encode_params.frameRateDen = avctx->time_base.num * avctx->ticks_per_frame;
 
-    num_mbs = ((avctx->width + 15) >> 4) * ((avctx->height + 15) >> 4);
-    ctx->max_surface_count = (num_mbs >= 8160) ? 32 : 48;
-
-    if (ctx->buffer_delay >= ctx->max_surface_count)
-        ctx->buffer_delay = ctx->max_surface_count - 1;
-
     ctx->init_encode_params.enableEncodeAsync = 0;
     ctx->init_encode_params.enablePTD = 1;
 
-    ctx->init_encode_params.presetGUID = encoder_preset;
-
-    ctx->init_encode_params.encodeConfig = &ctx->encode_config;
-    memcpy(&ctx->encode_config, &preset_config.presetCfg, sizeof(ctx->encode_config));
-    ctx->encode_config.version = NV_ENC_CONFIG_VER;
-
-    if (avctx->refs >= 0) {
-        /* 0 means "let the hardware decide" */
-        switch (avctx->codec->id) {
-        case AV_CODEC_ID_H264:
-            ctx->encode_config.encodeCodecConfig.h264Config.maxNumRefFrames = avctx->refs;
-            break;
-        case AV_CODEC_ID_H265:
-            ctx->encode_config.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = avctx->refs;
-            break;
-        /* Earlier switch/case will return if unknown codec is passed. */
-        }
-    }
-
     if (avctx->gop_size > 0) {
         if (avctx->max_b_frames >= 0) {
-            /* 0 is intra-only, 1 is I/P only, 2 is one B Frame, 3 two B frames, and so on. */
+            /* 0 is intra-only, 1 is I/P only, 2 is one B-Frame, 3 two B-frames, and so on. */
             ctx->encode_config.frameIntervalP = avctx->max_b_frames + 1;
         }
 
         ctx->encode_config.gopLength = avctx->gop_size;
-        switch (avctx->codec->id) {
-        case AV_CODEC_ID_H264:
-            ctx->encode_config.encodeCodecConfig.h264Config.idrPeriod = avctx->gop_size;
-            break;
-        case AV_CODEC_ID_H265:
-            ctx->encode_config.encodeCodecConfig.hevcConfig.idrPeriod = avctx->gop_size;
-            break;
-        /* Earlier switch/case will return if unknown codec is passed. */
-        }
     } else if (avctx->gop_size == 0) {
         ctx->encode_config.frameIntervalP = 0;
         ctx->encode_config.gopLength = 1;
-        switch (avctx->codec->id) {
-        case AV_CODEC_ID_H264:
-            ctx->encode_config.encodeCodecConfig.h264Config.idrPeriod = 1;
-            break;
-        case AV_CODEC_ID_H265:
-            ctx->encode_config.encodeCodecConfig.hevcConfig.idrPeriod = 1;
-            break;
-        /* Earlier switch/case will return if unknown codec is passed. */
-        }
     }
 
-    /* when there're b frames, set dts offset */
-    if (ctx->encode_config.frameIntervalP >= 2)
-        ctx->last_dts = -2;
+    ctx->initial_pts[0] = AV_NOPTS_VALUE;
+    ctx->initial_pts[1] = AV_NOPTS_VALUE;
 
-    nvenc_setup_rate_control(avctx, lossless);
+    nvenc_setup_rate_control(avctx);
 
     if (avctx->flags & AV_CODEC_FLAG_INTERLACED_DCT) {
         ctx->encode_config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FIELD;
@@ -1092,7 +1036,7 @@ static av_cold int nvenc_setup_encoder(AVCodecContext *avctx)
         ctx->encode_config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
     }
 
-    res = nvenc_setup_codec_config(avctx, lossless);
+    res = nvenc_setup_codec_config(avctx);
     if (res)
         return res;
 
@@ -1136,8 +1080,24 @@ static av_cold int nvenc_alloc_surface(AVCodecContext *avctx, int idx)
         ctx->surfaces[idx].format = NV_ENC_BUFFER_FORMAT_NV12_PL;
         break;
 
+    case AV_PIX_FMT_P010:
+        ctx->surfaces[idx].format = NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
+        break;
+
     case AV_PIX_FMT_YUV444P:
         ctx->surfaces[idx].format = NV_ENC_BUFFER_FORMAT_YUV444_PL;
+        break;
+
+    case AV_PIX_FMT_YUV444P16:
+        ctx->surfaces[idx].format = NV_ENC_BUFFER_FORMAT_YUV444_10BIT;
+        break;
+
+    case AV_PIX_FMT_0RGB32:
+        ctx->surfaces[idx].format = NV_ENC_BUFFER_FORMAT_ARGB;
+        break;
+
+    case AV_PIX_FMT_0BGR32:
+        ctx->surfaces[idx].format = NV_ENC_BUFFER_FORMAT_ABGR;
         break;
 
     default:
@@ -1169,7 +1129,8 @@ static av_cold int nvenc_alloc_surface(AVCodecContext *avctx, int idx)
 
     ctx->surfaces[idx].lockCount = 0;
 
-    /* 1MB is large enough to hold most output frames. NVENC increases this automaticaly if it's not enough. */
+    /* 1MB is large enough to hold most output frames.
+     * NVENC increases this automaticaly if it is not enough. */
     allocOut.size = 1024 * 1024;
 
     allocOut.memoryHeap = NV_ENC_MEMORY_HEAP_SYSMEM_CACHED;
@@ -1189,30 +1150,32 @@ static av_cold int nvenc_alloc_surface(AVCodecContext *avctx, int idx)
     return 0;
 }
 
-static av_cold int nvenc_setup_surfaces(AVCodecContext *avctx, int* surfaceCount)
+static av_cold int nvenc_setup_surfaces(AVCodecContext *avctx)
 {
-    int res;
     NvencContext *ctx = avctx->priv_data;
+    int i, res;
+    int num_mbs = ((avctx->width + 15) >> 4) * ((avctx->height + 15) >> 4);
+    ctx->nb_surfaces = FFMAX((num_mbs >= 8160) ? 32 : 48,
+                             ctx->nb_surfaces);
+    ctx->async_depth = FFMIN(ctx->async_depth, ctx->nb_surfaces - 1);
 
-    ctx->surfaces = av_malloc(ctx->max_surface_count * sizeof(*ctx->surfaces));
 
-    if (!ctx->surfaces) {
+    ctx->surfaces = av_mallocz_array(ctx->nb_surfaces, sizeof(*ctx->surfaces));
+    if (!ctx->surfaces)
         return AVERROR(ENOMEM);
-    }
 
-    ctx->timestamp_list = av_fifo_alloc(ctx->max_surface_count * sizeof(int64_t));
+    ctx->timestamp_list = av_fifo_alloc(ctx->nb_surfaces * sizeof(int64_t));
     if (!ctx->timestamp_list)
         return AVERROR(ENOMEM);
-    ctx->output_surface_queue = av_fifo_alloc(ctx->max_surface_count * sizeof(NvencSurface*));
+    ctx->output_surface_queue = av_fifo_alloc(ctx->nb_surfaces * sizeof(NvencSurface*));
     if (!ctx->output_surface_queue)
         return AVERROR(ENOMEM);
-    ctx->output_surface_ready_queue = av_fifo_alloc(ctx->max_surface_count * sizeof(NvencSurface*));
+    ctx->output_surface_ready_queue = av_fifo_alloc(ctx->nb_surfaces * sizeof(NvencSurface*));
     if (!ctx->output_surface_ready_queue)
         return AVERROR(ENOMEM);
 
-    for (*surfaceCount = 0; *surfaceCount < ctx->max_surface_count; ++*surfaceCount) {
-        res = nvenc_alloc_surface(avctx, *surfaceCount);
-        if (res)
+    for (i = 0; i < ctx->nb_surfaces; i++) {
+        if ((res = nvenc_alloc_surface(avctx, i)) < 0)
             return res;
     }
 
@@ -1252,82 +1215,27 @@ static av_cold int nvenc_setup_extradata(AVCodecContext *avctx)
     return 0;
 }
 
-static av_cold int nvenc_encode_init(AVCodecContext *avctx)
+av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
 {
-    NvencContext *ctx = avctx->priv_data;
-    NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
-    NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
-
-    int res;
-    int i;
-    int surfaceCount = 0;
-
-    if (!nvenc_dyload_nvenc(avctx))
-        return AVERROR_EXTERNAL;
-
-    res = nvenc_setup_device(avctx);
-    if (res)
-        goto error;
-
-    res = nvenc_open_session(avctx);
-    if (res)
-        goto error;
-
-    res = nvenc_setup_encoder(avctx);
-    if (res)
-        goto error;
-
-    res = nvenc_setup_surfaces(avctx, &surfaceCount);
-    if (res)
-        goto error;
-
-    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
-        res = nvenc_setup_extradata(avctx);
-        if (res)
-            goto error;
-    }
-
-    return 0;
-
-error:
-    av_fifo_freep(&ctx->timestamp_list);
-    av_fifo_freep(&ctx->output_surface_ready_queue);
-    av_fifo_freep(&ctx->output_surface_queue);
-
-    for (i = 0; i < surfaceCount; ++i) {
-        if (avctx->pix_fmt != AV_PIX_FMT_CUDA)
-            p_nvenc->nvEncDestroyInputBuffer(ctx->nvencoder, ctx->surfaces[i].input_surface);
-        av_frame_free(&ctx->surfaces[i].in_ref);
-        p_nvenc->nvEncDestroyBitstreamBuffer(ctx->nvencoder, ctx->surfaces[i].output_surface);
-    }
-    av_freep(&ctx->surfaces);
-
-    if (ctx->nvencoder)
-        p_nvenc->nvEncDestroyEncoder(ctx->nvencoder);
-    ctx->nvencoder = NULL;
-
-    if (ctx->cu_context_internal)
-        dl_fn->cu_ctx_destroy(ctx->cu_context_internal);
-    ctx->cu_context = ctx->cu_context_internal = NULL;
-
-    nvenc_unload_nvenc(avctx);
-
-    return res;
-}
-
-static av_cold int nvenc_encode_close(AVCodecContext *avctx)
-{
-    NvencContext *ctx = avctx->priv_data;
+    NvencContext *ctx               = avctx->priv_data;
     NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
     NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
     int i;
+
+    /* the encoder has to be flushed before it can be closed */
+    if (ctx->nvencoder) {
+        NV_ENC_PIC_PARAMS params        = { .version        = NV_ENC_PIC_PARAMS_VER,
+                                            .encodePicFlags = NV_ENC_PIC_FLAG_EOS };
+
+        p_nvenc->nvEncEncodePicture(ctx->nvencoder, &params);
+    }
 
     av_fifo_freep(&ctx->timestamp_list);
     av_fifo_freep(&ctx->output_surface_ready_queue);
     av_fifo_freep(&ctx->output_surface_queue);
 
-    if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
-        for (i = 0; i < ctx->max_surface_count; ++i) {
+    if (ctx->surfaces && avctx->pix_fmt == AV_PIX_FMT_CUDA) {
+        for (i = 0; i < ctx->nb_surfaces; ++i) {
             if (ctx->surfaces[i].input_surface) {
                  p_nvenc->nvEncUnmapInputResource(ctx->nvencoder, ctx->surfaces[i].in_map.mappedResource);
             }
@@ -1339,23 +1247,85 @@ static av_cold int nvenc_encode_close(AVCodecContext *avctx)
         ctx->nb_registered_frames = 0;
     }
 
-    for (i = 0; i < ctx->max_surface_count; ++i) {
-        if (avctx->pix_fmt != AV_PIX_FMT_CUDA)
-            p_nvenc->nvEncDestroyInputBuffer(ctx->nvencoder, ctx->surfaces[i].input_surface);
-        av_frame_free(&ctx->surfaces[i].in_ref);
-        p_nvenc->nvEncDestroyBitstreamBuffer(ctx->nvencoder, ctx->surfaces[i].output_surface);
+    if (ctx->surfaces) {
+        for (i = 0; i < ctx->nb_surfaces; ++i) {
+            if (avctx->pix_fmt != AV_PIX_FMT_CUDA)
+                p_nvenc->nvEncDestroyInputBuffer(ctx->nvencoder, ctx->surfaces[i].input_surface);
+            av_frame_free(&ctx->surfaces[i].in_ref);
+            p_nvenc->nvEncDestroyBitstreamBuffer(ctx->nvencoder, ctx->surfaces[i].output_surface);
+        }
     }
     av_freep(&ctx->surfaces);
-    ctx->max_surface_count = 0;
+    ctx->nb_surfaces = 0;
 
-    p_nvenc->nvEncDestroyEncoder(ctx->nvencoder);
+    if (ctx->nvencoder)
+        p_nvenc->nvEncDestroyEncoder(ctx->nvencoder);
     ctx->nvencoder = NULL;
 
     if (ctx->cu_context_internal)
         dl_fn->cu_ctx_destroy(ctx->cu_context_internal);
     ctx->cu_context = ctx->cu_context_internal = NULL;
 
-    nvenc_unload_nvenc(avctx);
+    if (dl_fn->nvenc)
+        dlclose(dl_fn->nvenc);
+    dl_fn->nvenc = NULL;
+
+    dl_fn->nvenc_device_count = 0;
+
+#if !CONFIG_CUDA
+    if (dl_fn->cuda)
+        dlclose(dl_fn->cuda);
+    dl_fn->cuda = NULL;
+#endif
+
+    dl_fn->cu_init = NULL;
+    dl_fn->cu_device_get_count = NULL;
+    dl_fn->cu_device_get = NULL;
+    dl_fn->cu_device_get_name = NULL;
+    dl_fn->cu_device_compute_capability = NULL;
+    dl_fn->cu_ctx_create = NULL;
+    dl_fn->cu_ctx_pop_current = NULL;
+    dl_fn->cu_ctx_destroy = NULL;
+
+    av_log(avctx, AV_LOG_VERBOSE, "Nvenc unloaded\n");
+
+    return 0;
+}
+
+av_cold int ff_nvenc_encode_init(AVCodecContext *avctx)
+{
+    NvencContext *ctx = avctx->priv_data;
+    int ret;
+
+    if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
+        AVHWFramesContext *frames_ctx;
+        if (!avctx->hw_frames_ctx) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "hw_frames_ctx must be set when using GPU frames as input\n");
+            return AVERROR(EINVAL);
+        }
+        frames_ctx = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
+        ctx->data_pix_fmt = frames_ctx->sw_format;
+    } else {
+        ctx->data_pix_fmt = avctx->pix_fmt;
+    }
+
+    if ((ret = nvenc_load_libraries(avctx)) < 0)
+        return ret;
+
+    if ((ret = nvenc_setup_device(avctx)) < 0)
+        return ret;
+
+    if ((ret = nvenc_setup_encoder(avctx)) < 0)
+        return ret;
+
+    if ((ret = nvenc_setup_surfaces(avctx)) < 0)
+        return ret;
+
+    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
+        if ((ret = nvenc_setup_extradata(avctx)) < 0)
+            return ret;
+    }
 
     return 0;
 }
@@ -1364,7 +1334,7 @@ static NvencSurface *get_free_frame(NvencContext *ctx)
 {
     int i;
 
-    for (i = 0; i < ctx->max_surface_count; ++i) {
+    for (i = 0; i < ctx->nb_surfaces; ++i) {
         if (!ctx->surfaces[i].lockCount) {
             ctx->surfaces[i].lockCount = 1;
             return &ctx->surfaces[i];
@@ -1374,58 +1344,32 @@ static NvencSurface *get_free_frame(NvencContext *ctx)
     return NULL;
 }
 
-static int nvenc_copy_frame(AVCodecContext *avctx, NvencSurface *inSurf,
-            NV_ENC_LOCK_INPUT_BUFFER *lockBufferParams, const AVFrame *frame)
+static int nvenc_copy_frame(AVCodecContext *avctx, NvencSurface *nv_surface,
+            NV_ENC_LOCK_INPUT_BUFFER *lock_buffer_params, const AVFrame *frame)
 {
-    uint8_t *buf = lockBufferParams->bufferDataPtr;
-    int off = inSurf->height * lockBufferParams->pitch;
+    int dst_linesize[4] = {
+        lock_buffer_params->pitch,
+        lock_buffer_params->pitch,
+        lock_buffer_params->pitch,
+        lock_buffer_params->pitch
+    };
+    uint8_t *dst_data[4];
+    int ret;
 
-    if (frame->format == AV_PIX_FMT_YUV420P) {
-        av_image_copy_plane(buf, lockBufferParams->pitch,
-            frame->data[0], frame->linesize[0],
-            avctx->width, avctx->height);
+    if (frame->format == AV_PIX_FMT_YUV420P)
+        dst_linesize[1] = dst_linesize[2] >>= 1;
 
-        buf += off;
+    ret = av_image_fill_pointers(dst_data, frame->format, nv_surface->height,
+                                 lock_buffer_params->bufferDataPtr, dst_linesize);
+    if (ret < 0)
+        return ret;
 
-        av_image_copy_plane(buf, lockBufferParams->pitch >> 1,
-            frame->data[2], frame->linesize[2],
-            avctx->width >> 1, avctx->height >> 1);
+    if (frame->format == AV_PIX_FMT_YUV420P)
+        FFSWAP(uint8_t*, dst_data[1], dst_data[2]);
 
-        buf += off >> 2;
-
-        av_image_copy_plane(buf, lockBufferParams->pitch >> 1,
-            frame->data[1], frame->linesize[1],
-            avctx->width >> 1, avctx->height >> 1);
-    } else if (frame->format == AV_PIX_FMT_NV12) {
-        av_image_copy_plane(buf, lockBufferParams->pitch,
-            frame->data[0], frame->linesize[0],
-            avctx->width, avctx->height);
-
-        buf += off;
-
-        av_image_copy_plane(buf, lockBufferParams->pitch,
-            frame->data[1], frame->linesize[1],
-            avctx->width, avctx->height >> 1);
-    } else if (frame->format == AV_PIX_FMT_YUV444P) {
-        av_image_copy_plane(buf, lockBufferParams->pitch,
-            frame->data[0], frame->linesize[0],
-            avctx->width, avctx->height);
-
-        buf += off;
-
-        av_image_copy_plane(buf, lockBufferParams->pitch,
-            frame->data[1], frame->linesize[1],
-            avctx->width, avctx->height);
-
-        buf += off;
-
-        av_image_copy_plane(buf, lockBufferParams->pitch,
-            frame->data[2], frame->linesize[2],
-            avctx->width, avctx->height);
-    } else {
-        av_log(avctx, AV_LOG_FATAL, "Invalid pixel format!\n");
-        return AVERROR(EINVAL);
-    }
+    av_image_copy(dst_data, dst_linesize,
+                  (const uint8_t**)frame->data, frame->linesize, frame->format,
+                  avctx->width, avctx->height);
 
     return 0;
 }
@@ -1527,6 +1471,7 @@ static int nvenc_upload_frame(AVCodecContext *avctx, const AVFrame *frame,
         ctx->registered_frames[reg_idx].mapped = 1;
         nvenc_frame->reg_idx                   = reg_idx;
         nvenc_frame->input_surface             = nvenc_frame->in_map.mappedResource;
+        nvenc_frame->pitch                     = frame->linesize[0];
         return 0;
     } else {
         NV_ENC_LOCK_INPUT_BUFFER lockBufferParams = { 0 };
@@ -1539,6 +1484,7 @@ static int nvenc_upload_frame(AVCodecContext *avctx, const AVFrame *frame,
             return nvenc_print_error(avctx, nv_status, "Failed locking nvenc input buffer");
         }
 
+        nvenc_frame->pitch = lockBufferParams.pitch;
         res = nvenc_copy_frame(avctx, nvenc_frame, &lockBufferParams, frame);
 
         nv_status = p_nvenc->nvEncUnlockInputBuffer(ctx->nvencoder, nvenc_frame->input_surface);
@@ -1551,20 +1497,72 @@ static int nvenc_upload_frame(AVCodecContext *avctx, const AVFrame *frame,
 }
 
 static void nvenc_codec_specific_pic_params(AVCodecContext *avctx,
-                                                    NV_ENC_PIC_PARAMS *params)
+                                            NV_ENC_PIC_PARAMS *params)
 {
     NvencContext *ctx = avctx->priv_data;
 
     switch (avctx->codec->id) {
     case AV_CODEC_ID_H264:
-      params->codecPicParams.h264PicParams.sliceMode = ctx->encode_config.encodeCodecConfig.h264Config.sliceMode;
-      params->codecPicParams.h264PicParams.sliceModeData = ctx->encode_config.encodeCodecConfig.h264Config.sliceModeData;
+        params->codecPicParams.h264PicParams.sliceMode =
+            ctx->encode_config.encodeCodecConfig.h264Config.sliceMode;
+        params->codecPicParams.h264PicParams.sliceModeData =
+            ctx->encode_config.encodeCodecConfig.h264Config.sliceModeData;
       break;
-    case AV_CODEC_ID_H265:
-      params->codecPicParams.hevcPicParams.sliceMode = ctx->encode_config.encodeCodecConfig.hevcConfig.sliceMode;
-      params->codecPicParams.hevcPicParams.sliceModeData = ctx->encode_config.encodeCodecConfig.hevcConfig.sliceModeData;
-      break;
+    case AV_CODEC_ID_HEVC:
+        params->codecPicParams.hevcPicParams.sliceMode =
+            ctx->encode_config.encodeCodecConfig.hevcConfig.sliceMode;
+        params->codecPicParams.hevcPicParams.sliceModeData =
+            ctx->encode_config.encodeCodecConfig.hevcConfig.sliceModeData;
+        break;
     }
+}
+
+static inline void timestamp_queue_enqueue(AVFifoBuffer* queue, int64_t timestamp)
+{
+    av_fifo_generic_write(queue, &timestamp, sizeof(timestamp), NULL);
+}
+
+static inline int64_t timestamp_queue_dequeue(AVFifoBuffer* queue)
+{
+    int64_t timestamp = AV_NOPTS_VALUE;
+    if (av_fifo_size(queue) > 0)
+        av_fifo_generic_read(queue, &timestamp, sizeof(timestamp), NULL);
+
+    return timestamp;
+}
+
+static int nvenc_set_timestamp(AVCodecContext *avctx,
+                               NV_ENC_LOCK_BITSTREAM *params,
+                               AVPacket *pkt)
+{
+    NvencContext *ctx = avctx->priv_data;
+
+    pkt->pts = params->outputTimeStamp;
+
+    /* generate the first dts by linearly extrapolating the
+     * first two pts values to the past */
+    if (avctx->max_b_frames > 0 && !ctx->first_packet_output &&
+        ctx->initial_pts[1] != AV_NOPTS_VALUE) {
+        int64_t ts0 = ctx->initial_pts[0], ts1 = ctx->initial_pts[1];
+        int64_t delta;
+
+        if ((ts0 < 0 && ts1 > INT64_MAX + ts0) ||
+            (ts0 > 0 && ts1 < INT64_MIN + ts0))
+            return AVERROR(ERANGE);
+        delta = ts1 - ts0;
+
+        if ((delta < 0 && ts0 > INT64_MAX + delta) ||
+            (delta > 0 && ts0 < INT64_MIN + delta))
+            return AVERROR(ERANGE);
+        pkt->dts = ts0 - delta;
+
+        ctx->first_packet_output = 1;
+        return 0;
+    }
+
+    pkt->dts = timestamp_queue_dequeue(ctx->timestamp_list);
+
+    return 0;
 }
 
 static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSurface *tmpoutsurf)
@@ -1574,7 +1572,7 @@ static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSur
     NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
 
     uint32_t slice_mode_data;
-    uint32_t *slice_offsets;
+    uint32_t *slice_offsets = NULL;
     NV_ENC_LOCK_BITSTREAM lock_params = { 0 };
     NVENCSTATUS nv_status;
     int res = 0;
@@ -1596,7 +1594,7 @@ static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSur
     slice_offsets = av_mallocz(slice_mode_data * sizeof(*slice_offsets));
 
     if (!slice_offsets)
-        return AVERROR(ENOMEM);
+        goto error;
 
     lock_params.version = NV_ENC_LOCK_BITSTREAM_VER;
 
@@ -1661,44 +1659,43 @@ FF_ENABLE_DEPRECATION_WARNINGS
     ff_side_data_set_encoder_stats(pkt,
         (lock_params.frameAvgQP - 1) * FF_QP2LAMBDA, NULL, 0, pict_type);
 
-    pkt->pts = lock_params.outputTimeStamp;
-    pkt->dts = timestamp_queue_dequeue(ctx->timestamp_list);
-
-    /* when there're b frame(s), set dts offset */
-    if (ctx->encode_config.frameIntervalP >= 2)
-        pkt->dts -= 1;
-
-    if (pkt->dts > pkt->pts)
-        pkt->dts = pkt->pts;
-
-    if (ctx->last_dts != AV_NOPTS_VALUE && pkt->dts <= ctx->last_dts)
-        pkt->dts = ctx->last_dts + 1;
-
-    ctx->last_dts = pkt->dts;
+    res = nvenc_set_timestamp(avctx, &lock_params, pkt);
+    if (res < 0)
+        goto error2;
 
     av_free(slice_offsets);
 
     return 0;
 
 error:
-
-    av_free(slice_offsets);
     timestamp_queue_dequeue(ctx->timestamp_list);
+
+error2:
+    av_free(slice_offsets);
 
     return res;
 }
 
-static int output_ready(NvencContext *ctx, int flush)
+static int output_ready(AVCodecContext *avctx, int flush)
 {
+    NvencContext *ctx = avctx->priv_data;
     int nb_ready, nb_pending;
+
+    /* when B-frames are enabled, we wait for two initial timestamps to
+     * calculate the first dts */
+    if (!flush && avctx->max_b_frames > 0 &&
+        (ctx->initial_pts[0] == AV_NOPTS_VALUE || ctx->initial_pts[1] == AV_NOPTS_VALUE))
+        return 0;
 
     nb_ready   = av_fifo_size(ctx->output_surface_ready_queue)   / sizeof(NvencSurface*);
     nb_pending = av_fifo_size(ctx->output_surface_queue)         / sizeof(NvencSurface*);
-    return nb_ready > 0 && (flush || nb_ready + nb_pending >= ctx->buffer_delay);
+    if (flush)
+        return nb_ready > 0;
+    return (nb_ready > 0) && (nb_ready + nb_pending >= ctx->async_depth);
 }
 
-static int nvenc_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
-    const AVFrame *frame, int *got_packet)
+int ff_nvenc_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+                          const AVFrame *frame, int *got_packet)
 {
     NVENCSTATUS nv_status;
     NvencSurface *tmpoutsurf, *inSurf;
@@ -1713,7 +1710,10 @@ static int nvenc_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     if (frame) {
         inSurf = get_free_frame(ctx);
-        av_assert0(inSurf);
+        if (!inSurf) {
+            av_log(avctx, AV_LOG_ERROR, "No free surfaces\n");
+            return AVERROR_BUG;
+        }
 
         res = nvenc_upload_frame(avctx, frame, inSurf);
         if (res) {
@@ -1725,50 +1725,50 @@ static int nvenc_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         pic_params.bufferFmt = inSurf->format;
         pic_params.inputWidth = avctx->width;
         pic_params.inputHeight = avctx->height;
+        pic_params.inputPitch = inSurf->pitch;
         pic_params.outputBitstream = inSurf->output_surface;
-        pic_params.completionEvent = 0;
 
         if (avctx->flags & AV_CODEC_FLAG_INTERLACED_DCT) {
-            if (frame->top_field_first) {
+            if (frame->top_field_first)
                 pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FIELD_TOP_BOTTOM;
-            } else {
+            else
                 pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FIELD_BOTTOM_TOP;
-            }
         } else {
             pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
         }
 
         pic_params.encodePicFlags = 0;
         pic_params.inputTimeStamp = frame->pts;
-        pic_params.inputDuration = 0;
 
         nvenc_codec_specific_pic_params(avctx, &pic_params);
-
-        timestamp_queue_enqueue(ctx->timestamp_list, frame->pts);
     } else {
         pic_params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
     }
 
     nv_status = p_nvenc->nvEncEncodePicture(ctx->nvencoder, &pic_params);
-
-    if (frame && nv_status == NV_ENC_ERR_NEED_MORE_INPUT)
-        av_fifo_generic_write(ctx->output_surface_queue, &inSurf, sizeof(inSurf), NULL);
-
-    if (nv_status != NV_ENC_SUCCESS && nv_status != NV_ENC_ERR_NEED_MORE_INPUT) {
+    if (nv_status != NV_ENC_SUCCESS &&
+        nv_status != NV_ENC_ERR_NEED_MORE_INPUT)
         return nvenc_print_error(avctx, nv_status, "EncodePicture failed!");
+
+    if (frame) {
+        av_fifo_generic_write(ctx->output_surface_queue, &inSurf, sizeof(inSurf), NULL);
+        timestamp_queue_enqueue(ctx->timestamp_list, frame->pts);
+
+        if (ctx->initial_pts[0] == AV_NOPTS_VALUE)
+            ctx->initial_pts[0] = frame->pts;
+        else if (ctx->initial_pts[1] == AV_NOPTS_VALUE)
+            ctx->initial_pts[1] = frame->pts;
     }
 
-    if (nv_status != NV_ENC_ERR_NEED_MORE_INPUT) {
+    /* all the pending buffers are now ready for output */
+    if (nv_status == NV_ENC_SUCCESS) {
         while (av_fifo_size(ctx->output_surface_queue) > 0) {
             av_fifo_generic_read(ctx->output_surface_queue, &tmpoutsurf, sizeof(tmpoutsurf), NULL);
             av_fifo_generic_write(ctx->output_surface_ready_queue, &tmpoutsurf, sizeof(tmpoutsurf), NULL);
         }
-
-        if (frame)
-            av_fifo_generic_write(ctx->output_surface_ready_queue, &inSurf, sizeof(inSurf), NULL);
     }
 
-    if (output_ready(ctx, !frame)) {
+    if (output_ready(avctx, !frame)) {
         av_fifo_generic_read(ctx->output_surface_ready_queue, &tmpoutsurf, sizeof(tmpoutsurf), NULL);
 
         res = process_output_surface(avctx, pkt, tmpoutsurf);
@@ -1786,112 +1786,3 @@ static int nvenc_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     return 0;
 }
-
-static const enum AVPixelFormat pix_fmts_nvenc[] = {
-    AV_PIX_FMT_YUV420P,
-    AV_PIX_FMT_NV12,
-    AV_PIX_FMT_YUV444P,
-#if CONFIG_CUDA
-    AV_PIX_FMT_CUDA,
-#endif
-    AV_PIX_FMT_NONE
-};
-
-#define OFFSET(x) offsetof(NvencContext, x)
-#define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
-static const AVOption options[] = {
-    { "preset", "Set the encoding preset (one of slow = hq 2pass, medium = hq, fast = hp, hq, hp, bd, ll, llhq, llhp, lossless, losslesshp, default)", OFFSET(preset), AV_OPT_TYPE_STRING, { .str = "medium" }, 0, 0, VE },
-    { "profile", "Set the encoding profile (high, main, baseline or high444p)", OFFSET(profile), AV_OPT_TYPE_STRING, { .str = "main" }, 0, 0, VE },
-    { "level", "Set the encoding level restriction (auto, 1.0, 1.0b, 1.1, 1.2, ..., 4.2, 5.0, 5.1)", OFFSET(level), AV_OPT_TYPE_STRING, { .str = "auto" }, 0, 0, VE },
-    { "tier", "Set the encoding tier (main or high)", OFFSET(tier), AV_OPT_TYPE_STRING, { .str = "main" }, 0, 0, VE },
-    { "cbr", "Use cbr encoding mode", OFFSET(cbr), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
-    { "2pass", "Use 2pass encoding mode", OFFSET(twopass), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, VE },
-    { "gpu", "Selects which NVENC capable GPU to use. First GPU is 0, second is 1, and so on.", OFFSET(gpu), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VE },
-    { "delay", "Delays frame output by the given amount of frames.", OFFSET(buffer_delay), AV_OPT_TYPE_INT, { .i64 = INT_MAX }, 0, INT_MAX, VE },
-    { NULL }
-};
-
-static const AVCodecDefault nvenc_defaults[] = {
-    { "b", "2M" },
-    { "qmin", "-1" },
-    { "qmax", "-1" },
-    { "qdiff", "-1" },
-    { "qblur", "-1" },
-    { "qcomp", "-1" },
-    { "g", "250" },
-    { "bf", "0" },
-    { NULL },
-};
-
-#if CONFIG_NVENC_ENCODER
-static const AVClass nvenc_class = {
-    .class_name = "nvenc",
-    .item_name = av_default_item_name,
-    .option = options,
-    .version = LIBAVUTIL_VERSION_INT,
-};
-
-AVCodec ff_nvenc_encoder = {
-    .name = "nvenc",
-    .long_name = NULL_IF_CONFIG_SMALL("NVIDIA NVENC h264 encoder"),
-    .type = AVMEDIA_TYPE_VIDEO,
-    .id = AV_CODEC_ID_H264,
-    .priv_data_size = sizeof(NvencContext),
-    .init = nvenc_encode_init,
-    .encode2 = nvenc_encode_frame,
-    .close = nvenc_encode_close,
-    .capabilities = AV_CODEC_CAP_DELAY,
-    .priv_class = &nvenc_class,
-    .defaults = nvenc_defaults,
-    .pix_fmts = pix_fmts_nvenc,
-};
-#endif
-
-/* Add an alias for nvenc_h264 */
-#if CONFIG_NVENC_H264_ENCODER
-static const AVClass nvenc_h264_class = {
-    .class_name = "nvenc_h264",
-    .item_name = av_default_item_name,
-    .option = options,
-    .version = LIBAVUTIL_VERSION_INT,
-};
-
-AVCodec ff_nvenc_h264_encoder = {
-    .name = "nvenc_h264",
-    .long_name = NULL_IF_CONFIG_SMALL("NVIDIA NVENC h264 encoder"),
-    .type = AVMEDIA_TYPE_VIDEO,
-    .id = AV_CODEC_ID_H264,
-    .priv_data_size = sizeof(NvencContext),
-    .init = nvenc_encode_init,
-    .encode2 = nvenc_encode_frame,
-    .close = nvenc_encode_close,
-    .capabilities = AV_CODEC_CAP_DELAY,
-    .priv_class = &nvenc_h264_class,
-    .defaults = nvenc_defaults,
-    .pix_fmts = pix_fmts_nvenc,
-};
-#endif
-
-#if CONFIG_NVENC_HEVC_ENCODER
-static const AVClass nvenc_hevc_class = {
-    .class_name = "nvenc_hevc",
-    .item_name = av_default_item_name,
-    .option = options,
-    .version = LIBAVUTIL_VERSION_INT,
-};
-
-AVCodec ff_nvenc_hevc_encoder = {
-    .name = "nvenc_hevc",
-    .long_name = NULL_IF_CONFIG_SMALL("NVIDIA NVENC hevc encoder"),
-    .type = AVMEDIA_TYPE_VIDEO,
-    .id = AV_CODEC_ID_H265,
-    .priv_data_size = sizeof(NvencContext),
-    .init = nvenc_encode_init,
-    .encode2 = nvenc_encode_frame,
-    .close = nvenc_encode_close,
-    .capabilities = AV_CODEC_CAP_DELAY,
-    .priv_class = &nvenc_hevc_class,
-    .defaults = nvenc_defaults,
-    .pix_fmts = pix_fmts_nvenc,
-};
-#endif

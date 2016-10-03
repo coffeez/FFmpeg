@@ -651,6 +651,11 @@ static int seg_init(AVFormatContext *s)
         seg->individual_header_trailer = 0;
     }
 
+    if (seg->initial_offset > 0) {
+        av_log(s, AV_LOG_WARNING, "NOTE: the option initial_offset is deprecated,"
+               "you can use output_ts_offset instead of it\n");
+    }
+
     if (!!seg->time_str + !!seg->times_str + !!seg->frames_str > 1) {
         av_log(s, AV_LOG_ERROR,
                "segment_time, segment_times, and segment_frames options "
@@ -957,23 +962,6 @@ fail:
     return ret;
 }
 
-static int seg_check_bitstream(struct AVFormatContext *s, const AVPacket *pkt)
-{
-    SegmentContext *seg = s->priv_data;
-    AVFormatContext *oc = seg->avf;
-    if (oc->oformat->check_bitstream) {
-        int ret = oc->oformat->check_bitstream(oc, pkt);
-        if (ret == 1) {
-            AVStream *st = s->streams[pkt->stream_index];
-            AVStream *ost = oc->streams[pkt->stream_index];
-            st->internal->bsfc = ost->internal->bsfc;
-            ost->internal->bsfc = NULL;
-        }
-        return ret;
-    }
-    return 1;
-}
-
 #define OFFSET(x) offsetof(SegmentContext, x)
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
@@ -1035,7 +1023,6 @@ AVOutputFormat ff_segment_muxer = {
     .init           = seg_init,
     .write_packet   = seg_write_packet,
     .write_trailer  = seg_write_trailer,
-    .check_bitstream = seg_check_bitstream,
     .priv_class     = &seg_class,
 };
 
@@ -1054,6 +1041,5 @@ AVOutputFormat ff_stream_segment_muxer = {
     .init           = seg_init,
     .write_packet   = seg_write_packet,
     .write_trailer  = seg_write_trailer,
-    .check_bitstream = seg_check_bitstream,
     .priv_class     = &sseg_class,
 };

@@ -190,7 +190,7 @@ int ff_mjpeg_decode_dqt(MJpegDecodeContext *s)
             s->quant_matrixes[index][i] = get_bits(&s->gb, pr ? 16 : 8);
         }
 
-        // XXX FIXME finetune, and perhaps add dc too
+        // XXX FIXME fine-tune, and perhaps add dc too
         s->qscale[index] = FFMAX(s->quant_matrixes[index][1],
                                  s->quant_matrixes[index][8]) >> 1;
         av_log(s->avctx, AV_LOG_DEBUG, "qscale[%d]: %d\n",
@@ -1690,14 +1690,17 @@ static int mjpeg_decode_app(MJpegDecodeContext *s)
                    s->avctx->sample_aspect_ratio.num,
                    s->avctx->sample_aspect_ratio.den);
 
-        t_w = get_bits(&s->gb, 8);
-        t_h = get_bits(&s->gb, 8);
-        if (t_w && t_h) {
-            /* skip thumbnail */
-            if (len -10 - (t_w * t_h * 3) > 0)
-                len -= t_w * t_h * 3;
+        len -= 8;
+        if (len >= 2) {
+            t_w = get_bits(&s->gb, 8);
+            t_h = get_bits(&s->gb, 8);
+            if (t_w && t_h) {
+                /* skip thumbnail */
+                if (len -10 - (t_w * t_h * 3) > 0)
+                    len -= t_w * t_h * 3;
+            }
+            len -= 2;
         }
-        len -= 10;
         goto out;
     }
 
@@ -1876,34 +1879,35 @@ static int mjpeg_decode_com(MJpegDecodeContext *s)
 {
     int len = get_bits(&s->gb, 16);
     if (len >= 2 && 8 * len - 16 <= get_bits_left(&s->gb)) {
+        int i;
         char *cbuf = av_malloc(len - 1);
-        if (cbuf) {
-            int i;
-            for (i = 0; i < len - 2; i++)
-                cbuf[i] = get_bits(&s->gb, 8);
-            if (i > 0 && cbuf[i - 1] == '\n')
-                cbuf[i - 1] = 0;
-            else
-                cbuf[i] = 0;
+        if (!cbuf)
+            return AVERROR(ENOMEM);
 
-            if (s->avctx->debug & FF_DEBUG_PICT_INFO)
-                av_log(s->avctx, AV_LOG_INFO, "comment: '%s'\n", cbuf);
+        for (i = 0; i < len - 2; i++)
+            cbuf[i] = get_bits(&s->gb, 8);
+        if (i > 0 && cbuf[i - 1] == '\n')
+            cbuf[i - 1] = 0;
+        else
+            cbuf[i] = 0;
 
-            /* buggy avid, it puts EOI only at every 10th frame */
-            if (!strncmp(cbuf, "AVID", 4)) {
-                parse_avid(s, cbuf, len);
-            } else if (!strcmp(cbuf, "CS=ITU601"))
-                s->cs_itu601 = 1;
-            else if ((!strncmp(cbuf, "Intel(R) JPEG Library, version 1", 32) && s->avctx->codec_tag) ||
-                     (!strncmp(cbuf, "Metasoft MJPEG Codec", 20)))
-                s->flipped = 1;
-            else if (!strcmp(cbuf, "MULTISCOPE II")) {
-                s->avctx->sample_aspect_ratio = (AVRational) { 1, 2 };
-                s->multiscope = 2;
-            }
+        if (s->avctx->debug & FF_DEBUG_PICT_INFO)
+            av_log(s->avctx, AV_LOG_INFO, "comment: '%s'\n", cbuf);
 
-            av_free(cbuf);
+        /* buggy avid, it puts EOI only at every 10th frame */
+        if (!strncmp(cbuf, "AVID", 4)) {
+            parse_avid(s, cbuf, len);
+        } else if (!strcmp(cbuf, "CS=ITU601"))
+            s->cs_itu601 = 1;
+        else if ((!strncmp(cbuf, "Intel(R) JPEG Library, version 1", 32) && s->avctx->codec_tag) ||
+                 (!strncmp(cbuf, "Metasoft MJPEG Codec", 20)))
+            s->flipped = 1;
+        else if (!strcmp(cbuf, "MULTISCOPE II")) {
+            s->avctx->sample_aspect_ratio = (AVRational) { 1, 2 };
+            s->multiscope = 2;
         }
+
+        av_free(cbuf);
     }
 
     return 0;
@@ -2114,8 +2118,13 @@ int ff_mjpeg_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         else if (start_code >= APP0 && start_code <= APP15)
             mjpeg_decode_app(s);
             /* Comment */
-        else if (start_code == COM)
-            mjpeg_decode_com(s);
+        else if (start_code == COM) {
+            ret = mjpeg_decode_com(s);
+            if (ret < 0)
+                return ret;
+        } else if (start_code == DQT) {
+            ff_mjpeg_decode_dqt(s);
+        }
 
         ret = -1;
 
@@ -2146,9 +2155,6 @@ int ff_mjpeg_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             s->restart_interval = 0;
             s->restart_count    = 0;
             /* nothing to do on SOI */
-            break;
-        case DQT:
-            ff_mjpeg_decode_dqt(s);
             break;
         case DHT:
             if ((ret = ff_mjpeg_decode_dht(s)) < 0) {

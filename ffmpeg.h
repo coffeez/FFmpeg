@@ -66,6 +66,7 @@ enum HWAccelID {
     HWACCEL_VIDEOTOOLBOX,
     HWACCEL_QSV,
     HWACCEL_VAAPI,
+    HWACCEL_CUVID,
 };
 
 typedef struct HWAccel {
@@ -286,7 +287,6 @@ typedef struct InputStream {
 
     double ts_scale;
     int saw_first_ts;
-    int showed_multi_packet_warning;
     AVDictionary *decoder_opts;
     AVRational framerate;               /* framerate forced with -r */
     int top_field_first;
@@ -348,6 +348,9 @@ typedef struct InputStream {
     // number of frames/samples retrieved from the decoder
     uint64_t frames_decoded;
     uint64_t samples_decoded;
+
+    int64_t *dts_buffer;
+    int nb_dts_buffer;
 } InputStream;
 
 typedef struct InputFile {
@@ -415,8 +418,13 @@ typedef struct OutputStream {
     int64_t first_pts;
     /* dts of the last packet sent to the muxer */
     int64_t last_mux_dts;
-    AVBitStreamFilterContext *bitstream_filters;
+
+    int                    nb_bitstream_filters;
+    uint8_t                  *bsf_extradata_updated;
+    AVBSFContext            **bsf_ctx;
+
     AVCodecContext *enc_ctx;
+    AVCodecParameters *ref_par; /* associated input codec parameters with encoders options applied */
     AVCodec *enc;
     int64_t max_frames;
     AVFrame *filtered_frame;
@@ -471,6 +479,7 @@ typedef struct OutputStream {
     int keep_pix_fmt;
 
     AVCodecParserContext *parser;
+    AVCodecContext       *parser_avctx;
 
     /* stats */
     // combined size of all the packets written
@@ -572,7 +581,8 @@ void choose_sample_fmt(AVStream *st, AVCodec *codec);
 int configure_filtergraph(FilterGraph *fg);
 int configure_output_filter(FilterGraph *fg, OutputFilter *ofilter, AVFilterInOut *out);
 int ist_in_filtergraph(FilterGraph *fg, InputStream *ist);
-FilterGraph *init_simple_filtergraph(InputStream *ist, OutputStream *ost);
+int filtergraph_is_simple(FilterGraph *fg);
+int init_simple_filtergraph(InputStream *ist, OutputStream *ost);
 int init_complex_filtergraph(FilterGraph *fg);
 
 int ffmpeg_parse_options(int argc, char **argv);
@@ -585,5 +595,7 @@ int qsv_init(AVCodecContext *s);
 int qsv_transcode_init(OutputStream *ost);
 int vaapi_decode_init(AVCodecContext *avctx);
 int vaapi_device_init(const char *device);
+int cuvid_init(AVCodecContext *s);
+int cuvid_transcode_init(OutputStream *ost);
 
 #endif /* FFMPEG_H */
